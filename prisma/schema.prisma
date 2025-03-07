@@ -1,0 +1,58 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model GameSession {
+  id            String    @id @default(cuid())
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  status        GameStatus @default(WAITING)
+  players       Player[]
+  guesses       Guess[]
+  winningWord   String?   // Set when game is complete
+  completedAt   DateTime?
+}
+
+model Player {
+  id            String    @id @default(cuid())
+  sessionId     String
+  session       GameSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  joinedAt      DateTime  @default(now())
+  nickname      String
+  secretWord    String
+  isHost        Boolean   @default(false)
+  guesses       Guess[]
+  
+  @@index([sessionId])
+}
+
+model Guess {
+  id            String    @id @default(cuid())
+  sessionId     String
+  playerId      String
+  word          String
+  createdAt     DateTime  @default(now())
+  session       GameSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  player        Player    @relation(fields: [playerId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId])
+  @@index([playerId])
+}
+
+enum GameStatus {
+  WAITING     // Waiting for players to join
+  ACTIVE      // Game is in progress
+  COMPLETED   // Game has been won
+  ABANDONED   // Game was abandoned before completion
+}
