@@ -15,9 +15,10 @@ datasource db {
 
 model GameSession {
   id            String    @id @default(cuid())
+  title         String    @default("New Game")
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
-  status        GameStatus @default(WAITING)
+  status        GameStatus @default(WAITING_FOR_PLAYERS)
   players       Player[]
   guesses       Guess[]
   winningWord   String?   // Set when game is complete
@@ -30,7 +31,7 @@ model Player {
   session       GameSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
   joinedAt      DateTime  @default(now())
   nickname      String
-  secretWord    String
+  secretWord    String?   // Allow null until player sets their word
   isHost        Boolean   @default(false)
   guesses       Guess[]
   
@@ -51,8 +52,8 @@ model Guess {
 }
 
 enum GameStatus {
-  WAITING     // Waiting for players to join
-  ACTIVE      // Game is in progress
-  COMPLETED   // Game has been won
-  ABANDONED   // Game was abandoned before completion
+  WAITING_FOR_PLAYERS // Waiting for players to join
+  SETTING_WORDS      // Players are setting their secret words
+  ACTIVE             // Game is in progress
+  COMPLETED          // Game has been won
 }

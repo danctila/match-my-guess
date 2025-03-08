@@ -1,101 +1,228 @@
-import Image from "next/image";
+"use client";
+
+import { useState, useEffect } from "react";
+import { useRouter } from "next/navigation";
+import { useSocket } from "@/hooks/useSocket";
 
 export default function Home() {
-  return (
-    <div className="grid grid-rows-[20px_1fr_20px] items-center justify-items-center min-h-screen p-8 pb-20 gap-16 sm:p-20 font-[family-name:var(--font-geist-sans)]">
-      <main className="flex flex-col gap-8 row-start-2 items-center sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={180}
-          height={38}
-          priority
-        />
-        <ol className="list-inside list-decimal text-sm text-center sm:text-left font-[family-name:var(--font-geist-mono)]">
-          <li className="mb-2">
-            Get started by editing{" "}
-            <code className="bg-black/[.05] dark:bg-white/[.06] px-1 py-0.5 rounded font-semibold">
-              src/app/page.tsx
-            </code>
-            .
-          </li>
-          <li>Save and see your changes instantly.</li>
-        </ol>
+  const router = useRouter();
+  const {
+    isConnected,
+    error: socketError,
+    lobbyList,
+    createGame,
+    refreshGameList,
+  } = useSocket();
 
-        <div className="flex gap-4 items-center flex-col sm:flex-row">
-          <a
-            className="rounded-full border border-solid border-transparent transition-colors flex items-center justify-center bg-foreground text-background gap-2 hover:bg-[#383838] dark:hover:bg-[#ccc] text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={20}
-              height={20}
-            />
-            Deploy now
-          </a>
-          <a
-            className="rounded-full border border-solid border-black/[.08] dark:border-white/[.145] transition-colors flex items-center justify-center hover:bg-[#f2f2f2] dark:hover:bg-[#1a1a1a] hover:border-transparent text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 sm:min-w-44"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Read our docs
-          </a>
+  const [playerName, setPlayerName] = useState("");
+  const [gameTitle, setGameTitle] = useState("");
+  const [isCreating, setIsCreating] = useState(false);
+  const [isJoining, setIsJoining] = useState(false);
+  const [error, setError] = useState("");
+
+  // Restore player name from sessionStorage if available
+  useEffect(() => {
+    const savedName = sessionStorage.getItem("playerName");
+    if (savedName) {
+      setPlayerName(savedName);
+    }
+  }, []);
+
+  // Refresh game list when connected
+  useEffect(() => {
+    if (isConnected) {
+      refreshGameList();
+    }
+  }, [isConnected, refreshGameList]);
+
+  // Handle creation of a new game
+  const handleCreateGame = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!playerName.trim() || isCreating) return;
+
+    setIsCreating(true);
+    setError("");
+
+    try {
+      // Save the player name to sessionStorage
+      sessionStorage.setItem("playerName", playerName.trim());
+
+      // Create a new game
+      const gameId = await createGame(
+        playerName.trim(),
+        gameTitle.trim() || `${playerName}'s Game`
+      );
+
+      if (gameId) {
+        console.log(`Game created successfully: ${gameId}`);
+        router.push(`/game/${gameId}`);
+      } else {
+        setError("Failed to create game. Please try again.");
+      }
+    } catch (err) {
+      console.error("Failed to create game:", err);
+      setError("An error occurred. Please try again.");
+    } finally {
+      setIsCreating(false);
+    }
+  };
+
+  // Handle joining an existing game
+  const handleJoinGame = async (lobbyId: string) => {
+    if (!playerName.trim() || isJoining) return;
+
+    setIsJoining(true);
+    setError("");
+
+    try {
+      // Save the player name to sessionStorage before navigating
+      sessionStorage.setItem("playerName", playerName.trim());
+      console.log(`Joining game: ${lobbyId}`);
+      router.push(`/game/${lobbyId}`);
+    } catch (err) {
+      console.error("Failed to join game:", err);
+      setError("An error occurred. Please try again.");
+    } finally {
+      setIsJoining(false);
+    }
+  };
+
+  return (
+    <main className="min-h-screen bg-gray-50 flex flex-col p-4">
+      <div className="max-w-4xl w-full mx-auto">
+        <div className="text-center mb-8">
+          <h1 className="text-4xl font-bold text-gray-900 mb-2">
+            Match My Guess
+          </h1>
+          <p className="text-gray-600">
+            A multiplayer word guessing game. Keep guessing until you match your
+            opponent's word!
+          </p>
         </div>
-      </main>
-      <footer className="row-start-3 flex gap-6 flex-wrap items-center justify-center">
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/file.svg"
-            alt="File icon"
-            width={16}
-            height={16}
-          />
-          Learn
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/window.svg"
-            alt="Window icon"
-            width={16}
-            height={16}
-          />
-          Examples
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/globe.svg"
-            alt="Globe icon"
-            width={16}
-            height={16}
-          />
-          Go to nextjs.org →
-        </a>
-      </footer>
-    </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          {/* Player Info and Create Game Form */}
+          <div className="bg-white rounded-lg shadow-sm p-6 space-y-4 lg:col-span-1">
+            <div className="space-y-4 mb-6">
+              <h2 className="text-xl font-semibold text-gray-800">
+                Player Info
+              </h2>
+              <div className="space-y-2">
+                <label
+                  htmlFor="playerName"
+                  className="block text-sm font-medium text-gray-700"
+                >
+                  Your Name
+                </label>
+                <input
+                  type="text"
+                  id="playerName"
+                  value={playerName}
+                  onChange={(e) => setPlayerName(e.target.value)}
+                  placeholder="Enter your name"
+                  className="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  autoFocus
+                />
+              </div>
+            </div>
+
+            <h2 className="text-xl font-semibold text-gray-800">Create Game</h2>
+            <form onSubmit={handleCreateGame} className="space-y-4">
+              <div className="space-y-2">
+                <label
+                  htmlFor="gameTitle"
+                  className="block text-sm font-medium text-gray-700"
+                >
+                  Game Title (optional)
+                </label>
+                <input
+                  type="text"
+                  id="gameTitle"
+                  value={gameTitle}
+                  onChange={(e) => setGameTitle(e.target.value)}
+                  placeholder={`${playerName}'s Game`}
+                  className="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+              </div>
+
+              <button
+                type="submit"
+                disabled={!isConnected || !playerName.trim() || isCreating}
+                className="w-full px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 
+                       focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
+              >
+                {isCreating ? "Creating..." : "Create New Game"}
+              </button>
+            </form>
+
+            {error && <p className="text-red-600 text-sm mt-2">{error}</p>}
+            {socketError && (
+              <p className="text-red-600 text-sm mt-2">{socketError}</p>
+            )}
+          </div>
+
+          {/* Available Games List */}
+          <div className="bg-white rounded-lg shadow-sm p-6 space-y-4 lg:col-span-2">
+            <div className="flex justify-between items-center">
+              <h2 className="text-xl font-semibold text-gray-800">
+                Available Games
+              </h2>
+              <button
+                onClick={refreshGameList}
+                className="text-blue-600 hover:text-blue-800"
+                disabled={!isConnected}
+              >
+                Refresh
+              </button>
+            </div>
+
+            {!isConnected ? (
+              <p className="text-gray-500 py-4 text-center">
+                Connecting to server...
+              </p>
+            ) : lobbyList.length === 0 ? (
+              <p className="text-gray-500 py-4 text-center">
+                No games available. Create one to get started!
+              </p>
+            ) : (
+              <div className="space-y-3 mt-2">
+                {lobbyList.map((lobby) => (
+                  <div
+                    key={lobby.id}
+                    className="border rounded-lg p-4 hover:bg-gray-50 flex justify-between items-center"
+                  >
+                    <div>
+                      <h3 className="font-medium text-gray-800">
+                        {lobby.title}
+                      </h3>
+                      <p className="text-sm text-gray-500">
+                        Host: {lobby.host} • Players: {lobby.players}/2
+                      </p>
+                    </div>
+                    <button
+                      onClick={() => handleJoinGame(lobby.id)}
+                      disabled={
+                        !playerName.trim() || isJoining || lobby.players >= 2
+                      }
+                      className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 
+                             focus:outline-none focus:ring-2 focus:ring-blue-500 
+                             disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {isJoining ? "Joining..." : "Join"}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {!isConnected && (
+          <p className="mt-4 text-center text-sm text-red-600">
+            Connecting to server...
+          </p>
+        )}
+      </div>
+    </main>
   );
 }

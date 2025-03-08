@@ -1,262 +1,462 @@
 import express from 'express';
-import { createServer } from 'http';
+import http from 'http';
 import { Server } from 'socket.io';
 import cors from 'cors';
-import type { 
-  ServerToClientEvents,
-  ClientToServerEvents,
-  GameState,
-  PlayerState,
-  GuessState
-} from './types';
-import prisma from './prisma';
+import { v4 as uuidv4 } from 'uuid';
 
+// Simple types
+type GameStatus = 'WAITING' | 'SETTING_WORDS' | 'PLAYING' | 'COMPLETED';
+
+interface Player {
+  id: string;
+  name: string;
+  socketId: string;
+  secretWord: string;
+  isHost: boolean;
+}
+
+interface Guess {
+  playerId: string;
+  playerName: string;
+  word: string;
+  timestamp: Date;
+}
+
+interface Game {
+  id: string;
+  title: string;
+  status: GameStatus;
+  players: Player[];
+  guesses: Guess[];
+  winningWord: string | null;
+  createdAt: Date;
+}
+
+interface GameListItem {
+  id: string;
+  title: string;
+  players: number;
+  host: string;
+  status: GameStatus;
+}
+
+// In-memory storage
+const games = new Map<string, Game>();
+const playerToGame = new Map<string, string>();
+
+// Create server
 const app = express();
-const httpServer = createServer(app);
-const io = new Server<ClientToServerEvents, ServerToClientEvents>(httpServer, {
+app.use(cors());
+const httpServer = http.createServer(app);
+
+// Create Socket.IO server
+const io = new Server(httpServer, {
   cors: {
-    origin: process.env.NODE_ENV === 'production' 
-      ? 'https://your-production-domain.com'  // Update this with your actual domain
-      : 'http://localhost:3000',
+    origin: '*',
     methods: ['GET', 'POST']
   }
 });
 
-// In-memory game state for quick access
-const activeGames = new Map<string, GameState>();
-
-io.on('connection', (socket) => {
-  let currentGameId: string | null = null;
-  let currentPlayerId: string | null = null;
-
-  socket.on('joinGame', async (gameId: string, playerName: string, callback: (success: boolean) => void) => {
-    try {
-      const game = await prisma.gameSession.findUnique({
-        where: { id: gameId },
-        include: { players: true, guesses: true }
+// Get available games for lobby
+function getAvailableGames(): GameListItem[] {
+  const availableGames: GameListItem[] = [];
+  
+  Array.from(games.entries()).forEach(([gameId, game]) => {
+    // Only show games in WAITING status and with less than 2 players
+    if (game.status === 'WAITING' && game.players.length < 2) {
+      availableGames.push({
+        id: gameId,
+        title: game.title,
+        players: game.players.length,
+        host: game.players[0]?.name || 'Unknown',
+        status: game.status
       });
+    }
+  });
+  
+  console.log(`Available games: ${availableGames.length}`);
+  return availableGames;
+}
 
+// Check for matching guesses
+function checkForMatchingGuess(game: Game): string | null {
+  if (game.guesses.length < 2) return null;
+  
+  // Get the most recent guesses from each player
+  const recentGuesses = new Map<string, string>();
+  
+  // Process guesses in chronological order
+  const sortedGuesses = [...game.guesses].sort((a, b) => 
+    new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+  );
+  
+  for (const guess of sortedGuesses) {
+    recentGuesses.set(guess.playerId, guess.word);
+  }
+  
+  // Check if all players guessed the same word
+  const guessValues = Array.from(recentGuesses.values());
+  if (guessValues.length >= 2) {
+    const firstGuess = guessValues[0];
+    const allMatch = guessValues.every(guess => guess === firstGuess);
+    
+    if (allMatch) {
+      return firstGuess;
+    }
+  }
+  
+  return null;
+}
+
+// Socket.IO connection handler
+io.on('connection', (socket) => {
+  console.log(`Player connected: ${socket.id}`);
+  
+  // Send the list of available games to the newly connected client
+  socket.emit('gameList', getAvailableGames());
+  
+  // Create a new game
+  socket.on('createGame', (playerName, gameTitle, callback) => {
+    try {
+      const gameId = uuidv4();
+      
+      const player: Player = {
+        id: uuidv4(),
+        name: playerName,
+        socketId: socket.id,
+        secretWord: '',
+        isHost: true
+      };
+      
+      const game: Game = {
+        id: gameId,
+        title: gameTitle || `${playerName}'s Game`,
+        status: 'WAITING',
+        players: [player],
+        guesses: [],
+        winningWord: null,
+        createdAt: new Date()
+      };
+      
+      // Store game and player mapping
+      games.set(gameId, game);
+      playerToGame.set(socket.id, gameId);
+      
+      // Join the Socket.IO room
+      socket.join(gameId);
+      console.log(`Game created: ${gameId} by ${playerName}`);
+      
+      // Send game state to the player
+      socket.emit('gameState', game);
+      
+      // Send updated game list to everyone
+      io.emit('gameList', getAvailableGames());
+      
+      callback(gameId);
+    } catch (error) {
+      console.error('Error creating game:', error);
+      callback(null);
+    }
+  });
+  
+  // Join an existing game
+  socket.on('joinGame', (gameId, playerName, callback) => {
+    try {
+      console.log(`Join request: ${playerName} (${socket.id}) trying to join game ${gameId}`);
+      
+      // Check if player is already in this game
+      const currentGameId = playerToGame.get(socket.id);
+      if (currentGameId === gameId) {
+        console.log(`Player ${playerName} (${socket.id}) is already in game ${gameId}`);
+        // Player is already in this game, send the current game state
+        const game = games.get(gameId);
+        if (game) {
+          socket.emit('gameState', game);
+          callback(true);
+          return;
+        }
+      }
+      
+      const game = games.get(gameId);
+      
+      // Game not found
       if (!game) {
+        console.log(`Game ${gameId} not found`);
+        socket.emit('gameNotFound');
         callback(false);
-        socket.emit('error', 'Game not found');
         return;
       }
-
-      // Create new player
-      const player = await prisma.player.create({
-        data: {
-          sessionId: gameId,
-          nickname: playerName,
-          secretWord: '',
-          isHost: game.players.length === 0
-        }
-      });
-
-      // Join socket room
-      socket.join(gameId);
-      currentGameId = gameId;
-      currentPlayerId = player.id;
-
-      // Update game state
-      const playerState: PlayerState = {
-        id: player.id,
-        nickname: playerName,
-        isHost: player.isHost,
-        hasSetSecretWord: false
+      
+      // Game is full or not in waiting state
+      if (game.players.length >= 2 || game.status !== 'WAITING') {
+        console.log(`Game ${gameId} is full or not in waiting state. Players: ${game.players.length}, Status: ${game.status}`);
+        socket.emit('gameFull');
+        callback(false);
+        return;
+      }
+      
+      // Create player and add to game
+      const player: Player = {
+        id: uuidv4(),
+        name: playerName,
+        socketId: socket.id,
+        secretWord: '',
+        isHost: false
       };
-
-      // Notify others
-      socket.to(gameId).emit('playerJoined', playerState);
+      
+      game.players.push(player);
+      playerToGame.set(socket.id, gameId);
+      
+      // Join the Socket.IO room
+      socket.join(gameId);
+      console.log(`${playerName} (${socket.id}) joined game ${gameId}. Total players: ${game.players.length}`);
+      
+      // If we now have 2 players, update game status
+      if (game.players.length === 2) {
+        game.status = 'SETTING_WORDS';
+        console.log(`Game ${gameId} now has 2 players, updating status to SETTING_WORDS`);
+      }
+      
+      // Send game state to everyone in the room
+      io.to(gameId).emit('gameState', game);
+      
+      // Send updated game list to everyone
+      io.emit('gameList', getAvailableGames());
+      
       callback(true);
-
-      // Update active games map
-      updateGameState(gameId);
     } catch (error) {
       console.error('Error joining game:', error);
       callback(false);
-      socket.emit('error', 'Failed to join game');
     }
   });
-
-  socket.on('setSecretWord', async (word: string, callback: (success: boolean) => void) => {
-    if (!currentGameId || !currentPlayerId) {
-      callback(false);
-      return;
-    }
-
+  
+  // Set secret word
+  socket.on('setSecretWord', (word, callback) => {
     try {
-      await prisma.player.update({
-        where: { id: currentPlayerId },
-        data: { secretWord: word }
-      });
-
-      // Check if all players have set their secret words
-      const game = await prisma.gameSession.findUnique({
-        where: { id: currentGameId },
-        include: { players: true }
-      });
-
-      if (game && game.players.every(player => player.secretWord)) {
-        await prisma.gameSession.update({
-          where: { id: currentGameId },
-          data: { status: 'ACTIVE' }
-        });
+      const gameId = playerToGame.get(socket.id);
+      if (!gameId) {
+        console.log(`No game found for player ${socket.id}`);
+        callback(false);
+        return;
       }
-
+      
+      const game = games.get(gameId);
+      if (!game) {
+        console.log(`Game ${gameId} not found`);
+        callback(false);
+        return;
+      }
+      
+      // Find player and set word
+      const player = game.players.find(p => p.socketId === socket.id);
+      if (!player) {
+        console.log(`Player not found in game ${gameId}`);
+        callback(false);
+        return;
+      }
+      
+      console.log(`Player ${player.name} (${socket.id}) setting secret word in game ${gameId}`);
+      player.secretWord = word.toLowerCase().trim();
+      
+      // Check if all players have set their words
+      const allPlayersReady = game.players.every(p => p.secretWord);
+      if (allPlayersReady && game.status === 'SETTING_WORDS') {
+        game.status = 'PLAYING';
+        console.log(`Game ${gameId} - All players have set words, moving to PLAYING state`);
+      }
+      
+      // Send updated game state to all players
+      io.to(gameId).emit('gameState', game);
+      
       callback(true);
-      updateGameState(currentGameId);
     } catch (error) {
       console.error('Error setting secret word:', error);
       callback(false);
-      socket.emit('error', 'Failed to set secret word');
     }
   });
-
-  socket.on('makeGuess', async (word: string, callback: (success: boolean) => void) => {
-    if (!currentGameId || !currentPlayerId) {
-      callback(false);
-      return;
-    }
-
+  
+  // Make a guess
+  socket.on('makeGuess', (word, callback) => {
     try {
-      // Create the guess
-      const guess = await prisma.guess.create({
-        data: {
-          sessionId: currentGameId,
-          playerId: currentPlayerId,
-          word: word.toLowerCase().trim()
-        },
-        include: { player: true }
-      });
-
-      const guessState: GuessState = {
-        id: guess.id,
-        playerId: guess.playerId,
-        playerNickname: guess.player.nickname,
-        word: guess.word,
-        timestamp: guess.createdAt
-      };
-
-      // Broadcast the guess to all players in the game
-      io.to(currentGameId).emit('newGuess', guessState);
-
-      // Check for winning condition
-      const game = await prisma.gameSession.findUnique({
-        where: { id: currentGameId },
-        include: { players: true, guesses: { orderBy: { createdAt: 'desc' }, take: 2 } }
-      });
-
-      if (game && game.guesses.length >= 2) {
-        const [latestGuess, previousGuess] = game.guesses;
-        if (latestGuess.word === previousGuess.word && 
-            latestGuess.playerId !== previousGuess.playerId) {
-          // We have a winner!
-          await prisma.gameSession.update({
-            where: { id: currentGameId },
-            data: {
-              status: 'COMPLETED',
-              winningWord: latestGuess.word,
-              completedAt: new Date()
-            }
-          });
-
-          io.to(currentGameId).emit('gameOver', latestGuess.word);
-        }
+      const gameId = playerToGame.get(socket.id);
+      if (!gameId) {
+        callback(false);
+        return;
       }
-
+      
+      const game = games.get(gameId);
+      if (!game || game.status !== 'PLAYING') {
+        callback(false);
+        return;
+      }
+      
+      const player = game.players.find(p => p.socketId === socket.id);
+      if (!player) {
+        callback(false);
+        return;
+      }
+      
+      // Add guess
+      const guess: Guess = {
+        playerId: player.id,
+        playerName: player.name,
+        word: word.toLowerCase().trim(),
+        timestamp: new Date()
+      };
+      
+      console.log(`Player ${player.name} guessed: ${guess.word} in game ${gameId}`);
+      game.guesses.push(guess);
+      
+      // Check for matching guesses
+      const matchingWord = checkForMatchingGuess(game);
+      if (matchingWord) {
+        game.status = 'COMPLETED';
+        game.winningWord = matchingWord;
+        console.log(`Game ${gameId} - GAME OVER! Winning word: ${matchingWord}`);
+        
+        // Notify all players
+        io.to(gameId).emit('gameOver', matchingWord);
+      }
+      
+      // Send updated game state to all players
+      io.to(gameId).emit('gameState', game);
+      
       callback(true);
-      updateGameState(currentGameId);
     } catch (error) {
       console.error('Error making guess:', error);
       callback(false);
-      socket.emit('error', 'Failed to submit guess');
     }
   });
-
-  socket.on('leaveGame', async () => {
-    if (currentGameId && currentPlayerId) {
-      try {
-        await prisma.player.delete({
-          where: { id: currentPlayerId }
-        });
-
-        socket.to(currentGameId).emit('playerLeft', currentPlayerId);
-        socket.leave(currentGameId);
+  
+  // Leave game
+  socket.on('leaveGame', (callback) => {
+    try {
+      const gameId = playerToGame.get(socket.id);
+      
+      if (gameId) {
+        socket.leave(gameId);
+        console.log(`Player ${socket.id} leaving game ${gameId}`);
         
-        // Check if game should be abandoned
-        const game = await prisma.gameSession.findUnique({
-          where: { id: currentGameId },
-          include: { players: true }
-        });
-
-        if (game && game.players.length === 0) {
-          await prisma.gameSession.update({
-            where: { id: currentGameId },
-            data: { status: 'ABANDONED' }
-          });
+        const game = games.get(gameId);
+        if (game) {
+          // Remove player from game
+          const playerIndex = game.players.findIndex(p => p.socketId === socket.id);
+          
+          if (playerIndex !== -1) {
+            const player = game.players[playerIndex];
+            console.log(`Removing player ${player.name} from game ${gameId}`);
+            game.players.splice(playerIndex, 1);
+            
+            // If no players left, remove the game
+            if (game.players.length === 0) {
+              console.log(`No players left in game ${gameId}, removing game`);
+              games.delete(gameId);
+            } else {
+              // Otherwise, update game state
+              if (game.status !== 'COMPLETED') {
+                game.status = 'WAITING';
+              }
+              
+              // Make the first remaining player the host
+              if (game.players.length > 0) {
+                game.players[0].isHost = true;
+              }
+              
+              // Send updated game state to remaining players
+              io.to(gameId).emit('gameState', game);
+            }
+          }
         }
-
-        updateGameState(currentGameId);
-      } catch (error) {
-        console.error('Error leaving game:', error);
+        
+        playerToGame.delete(socket.id);
+        
+        // Send updated game list to everyone
+        io.emit('gameList', getAvailableGames());
       }
-
-      currentGameId = null;
-      currentPlayerId = null;
+      
+      callback();
+    } catch (error) {
+      console.error('Error leaving game:', error);
+      callback();
     }
   });
-
+  
+  // Get game list
+  socket.on('getGameList', () => {
+    try {
+      socket.emit('gameList', getAvailableGames());
+    } catch (error) {
+      console.error('Error getting game list:', error);
+    }
+  });
+  
+  // Handle disconnection
   socket.on('disconnect', () => {
-    if (currentGameId && currentPlayerId) {
-      // Handle disconnection by triggering the leave game logic
-      socket.emit('error', 'Disconnected from game');
-      socket.emit('playerLeft', currentPlayerId);
+    try {
+      console.log(`Player disconnected: ${socket.id}`);
+      
+      const gameId = playerToGame.get(socket.id);
+      if (gameId) {
+        const game = games.get(gameId);
+        if (game) {
+          // Remove player from game
+          const playerIndex = game.players.findIndex(p => p.socketId === socket.id);
+          
+          if (playerIndex !== -1) {
+            const player = game.players[playerIndex];
+            console.log(`Player ${player.name} disconnected from game ${gameId}`);
+            game.players.splice(playerIndex, 1);
+            
+            // If no players left, remove the game
+            if (game.players.length === 0) {
+              console.log(`No players left in game ${gameId}, removing game`);
+              games.delete(gameId);
+            } else {
+              // Otherwise, update game state
+              if (game.status !== 'COMPLETED') {
+                game.status = 'WAITING';
+              }
+              
+              // Make the first remaining player the host
+              if (game.players.length > 0) {
+                game.players[0].isHost = true;
+              }
+              
+              // Send updated game state to remaining players
+              io.to(gameId).emit('gameState', game);
+            }
+          }
+        }
+        
+        playerToGame.delete(socket.id);
+        
+        // Send updated game list to everyone
+        io.emit('gameList', getAvailableGames());
+      }
+    } catch (error) {
+      console.error('Error handling disconnect:', error);
     }
   });
 });
 
-async function updateGameState(gameId: string) {
+// Clean up old games every hour
+setInterval(() => {
   try {
-    const game = await prisma.gameSession.findUnique({
-      where: { id: gameId },
-      include: {
-        players: true,
-        guesses: {
-          include: { player: true },
-          orderBy: { createdAt: 'desc' }
-        }
+    const now = new Date();
+    Array.from(games.entries()).forEach(([gameId, game]) => {
+      // Remove games older than 24 hours
+      if (now.getTime() - new Date(game.createdAt).getTime() > 24 * 60 * 60 * 1000) {
+        console.log(`Cleaning up old game: ${gameId}`);
+        games.delete(gameId);
       }
     });
-
-    if (!game) return;
-
-    const gameState: GameState = {
-      id: game.id,
-      status: game.status,
-      players: game.players.map((player: { id: string; nickname: string; isHost: boolean; secretWord: string | null }) => ({
-        id: player.id,
-        nickname: player.nickname,
-        isHost: player.isHost,
-        hasSetSecretWord: Boolean(player.secretWord)
-      })),
-      guesses: game.guesses.map((guess: { id: string; playerId: string; word: string; createdAt: Date; player: { nickname: string } }) => ({
-        id: guess.id,
-        playerId: guess.playerId,
-        playerNickname: guess.player.nickname,
-        word: guess.word,
-        timestamp: guess.createdAt
-      }))
-    };
-
-    activeGames.set(gameId, gameState);
-    io.to(gameId).emit('gameStateUpdate', gameState);
   } catch (error) {
-    console.error('Error updating game state:', error);
+    console.error('Error cleaning up old games:', error);
   }
-}
+}, 60 * 60 * 1000);
 
-const PORT = process.env.PORT || 3001;
-
+// Start the server
+const PORT = process.env.PORT || 4000;
 httpServer.listen(PORT, () => {
-  console.log(`Socket.IO server running on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 }); 
