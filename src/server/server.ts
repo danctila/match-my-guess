@@ -14,6 +14,184 @@ const prisma = new PrismaClient() as PrismaClient & {
   move: any;
 };
 
+// Database operation queue
+interface DbOperation {
+  type: 'move' | 'gameComplete' | 'playerUpdate' | 'lobbyUpdate';
+  data: any;
+  retryCount: number;
+  priority: number; // Higher number = higher priority
+}
+
+const DB_OPERATION_QUEUE: DbOperation[] = [];
+const BATCH_SIZE = 10;
+const BATCH_INTERVAL = 2000; // 2 seconds
+const MAX_RETRIES = 3;
+let batchProcessorRunning = false;
+
+// Start the batch processor
+function startBatchProcessor() {
+  if (batchProcessorRunning) return;
+  
+  batchProcessorRunning = true;
+  console.log('Database batch processor started');
+  
+  // Process batches at regular intervals
+  setInterval(async () => {
+    if (DB_OPERATION_QUEUE.length === 0) return;
+    
+    // Sort by priority (higher first)
+    DB_OPERATION_QUEUE.sort((a, b) => b.priority - a.priority);
+    
+    // Take a batch of operations
+    const batch = DB_OPERATION_QUEUE.splice(0, Math.min(BATCH_SIZE, DB_OPERATION_QUEUE.length));
+    
+    try {
+      await processBatch(batch);
+    } catch (error) {
+      console.error('Error processing batch:', error);
+      
+      // Put failed operations back in the queue with increased retry count
+      batch.forEach(op => {
+        if (op.retryCount < MAX_RETRIES) {
+          op.retryCount++;
+          DB_OPERATION_QUEUE.push(op);
+        } else {
+          console.error(`Operation failed after ${MAX_RETRIES} retries:`, op);
+        }
+      });
+    }
+  }, BATCH_INTERVAL);
+}
+
+// Process a batch of database operations
+async function processBatch(operations: DbOperation[]) {
+  // Group operations by type for more efficient processing
+  const moveOps = operations.filter(op => op.type === 'move');
+  const gameCompleteOps = operations.filter(op => op.type === 'gameComplete');
+  const playerUpdateOps = operations.filter(op => op.type === 'playerUpdate');
+  const lobbyUpdateOps = operations.filter(op => op.type === 'lobbyUpdate');
+  
+  await prisma.$transaction(async (tx: any) => {
+    // Process moves (guesses)
+    if (moveOps.length > 0) {
+      console.log(`Processing ${moveOps.length} move operations`);
+      
+      for (const op of moveOps) {
+        const { gameId, playerId, word, guessId } = op.data;
+        
+        await tx.move.create({
+          data: {
+            id: guessId, // Use the same ID as in-memory
+            game: { connect: { id: gameId } },
+            player: { connect: { id: playerId } },
+            moveType: 'guess',
+            data: { word }
+          } as any
+        });
+      }
+    }
+    
+    // Process game completions
+    if (gameCompleteOps.length > 0) {
+      console.log(`Processing ${gameCompleteOps.length} game completion operations`);
+      
+      for (const op of gameCompleteOps) {
+        const { gameId, lobbyId, winningWord } = op.data;
+        
+        // Update game status
+        await tx.game.update({
+          where: { id: gameId },
+          data: {
+            status: 'COMPLETED',
+            endedAt: new Date(),
+            metadata: { winningWord }
+          } as any
+        });
+        
+        // Update lobby status
+        await tx.lobby.update({
+          where: { id: lobbyId },
+          data: { status: 'FINISHED' }
+        });
+      }
+    }
+    
+    // Process player updates
+    if (playerUpdateOps.length > 0) {
+      console.log(`Processing ${playerUpdateOps.length} player update operations`);
+      
+      for (const op of playerUpdateOps) {
+        const { playerId, data } = op.data;
+        
+        await tx.player.update({
+          where: { id: playerId },
+          data: data as any
+        });
+      }
+    }
+    
+    // Process lobby updates
+    if (lobbyUpdateOps.length > 0) {
+      console.log(`Processing ${lobbyUpdateOps.length} lobby update operations`);
+      
+      for (const op of lobbyUpdateOps) {
+        const { lobbyId, data } = op.data;
+        
+        await tx.lobby.update({
+          where: { id: lobbyId },
+          data
+        });
+      }
+    }
+  });
+  
+  console.log(`Successfully processed batch of ${operations.length} operations`);
+}
+
+// Queue a database operation
+function queueDbOperation(operation: DbOperation) {
+  DB_OPERATION_QUEUE.push(operation);
+  console.log(`Queued ${operation.type} operation, queue length: ${DB_OPERATION_QUEUE.length}`);
+}
+
+// Helper function to persist game state
+async function persistGameState(
+  game: Game, 
+  player: Player, 
+  guess: Guess, 
+  gameCompleted: boolean, 
+  matchingWord: string | null
+) {
+  // Queue the move operation
+  if (game.gameId && player.dbId) {
+    queueDbOperation({
+      type: 'move',
+      data: {
+        gameId: game.gameId,
+        playerId: player.dbId,
+        word: guess.word,
+        guessId: guess.id
+      },
+      retryCount: 0,
+      priority: 1
+    });
+  }
+  
+  // If game is completed, queue a game completion operation
+  if (gameCompleted && game.gameId && matchingWord) {
+    queueDbOperation({
+      type: 'gameComplete',
+      data: {
+        gameId: game.gameId,
+        lobbyId: game.lobbyId,
+        winningWord: matchingWord
+      },
+      retryCount: 0,
+      priority: 2 // Higher priority than regular moves
+    });
+  }
+}
+
 // Simple types
 type GameStatus = 'WAITING' | 'SETTING_WORDS' | 'PLAYING' | 'COMPLETED';
 
@@ -28,6 +206,7 @@ interface Player {
 }
 
 interface Guess {
+  id: string;  // Add this field for tracking
   playerId: string;
   playerName: string;
   word: string;
@@ -302,12 +481,15 @@ io.on('connection', (socket) => {
         game.status = 'SETTING_WORDS';
         console.log(`Game ${gameId} now has 2 players, updating status to SETTING_WORDS`);
         
-        // Update lobby status in database
-        await prisma.$transaction(async (tx: any) => {
-          await tx.lobby.update({
-            where: { id: game.lobbyId },
+        // Queue lobby status update
+        queueDbOperation({
+          type: 'lobbyUpdate',
+          data: {
+            lobbyId: game.lobbyId,
             data: { status: 'READY' }
-          });
+          },
+          retryCount: 0,
+          priority: 1
         });
       }
       
@@ -352,16 +534,19 @@ io.on('connection', (socket) => {
       console.log(`Player ${player.name} (${socket.id}) setting secret word in game ${gameId}`);
       player.secretWord = word.toLowerCase().trim();
       
-      // Update player metadata in database
+      // Queue player metadata update
       if (player.dbId) {
-        await prisma.$transaction(async (tx: any) => {
-          await tx.player.update({
-            where: { id: player.dbId },
+        queueDbOperation({
+          type: 'playerUpdate',
+          data: {
+            playerId: player.dbId,
             data: {
               metadata: { secretWord: player.secretWord },
               isReady: true
-            } as any
-          });
+            }
+          },
+          retryCount: 0,
+          priority: 1
         });
       }
       
@@ -371,7 +556,7 @@ io.on('connection', (socket) => {
         game.status = 'PLAYING';
         console.log(`Game ${gameId} - All players have set words, moving to PLAYING state`);
         
-        // Create a game in the database
+        // Create a game in the database immediately (this is important enough to not batch)
         const dbGame = await prisma.$transaction(async (tx: any) => {
           const newGame = await tx.game.create({
             data: {
@@ -437,8 +622,9 @@ io.on('connection', (socket) => {
         return;
       }
       
-      // Add guess
+      // Add guess with a unique ID
       const guess: Guess = {
+        id: uuidv4(), // Generate a unique ID for the guess
         playerId: player.id,
         playerName: player.name,
         word: word.toLowerCase().trim(),
@@ -448,53 +634,31 @@ io.on('connection', (socket) => {
       console.log(`Player ${player.name} guessed: ${guess.word} in game ${gameId}`);
       game.guesses.push(guess);
       
-      // Record move in database if game exists
-      if (game.gameId && player.dbId) {
-        const dbMove = await prisma.$transaction(async (tx: any) => {
-          return tx.move.create({
-            data: {
-              game: { connect: { id: game.gameId! } },
-              player: { connect: { id: player.dbId! } },
-              moveType: 'guess',
-              data: { word: guess.word }
-            } as any
-          });
-        });
-        
-        // Store the database ID
-        guess.dbId = dbMove.id;
-      }
+      // Broadcast the guess to all players in the room
+      io.to(gameId).emit('newGuess', {
+        id: guess.id,
+        playerId: guess.playerId,
+        playerName: guess.playerName,
+        word: guess.word,
+        timestamp: guess.timestamp
+      });
       
       // Check for matching guesses
       const matchingWord = checkForMatchingGuess(game);
+      let gameCompleted = false;
+      
       if (matchingWord) {
+        gameCompleted = true;
         game.status = 'COMPLETED';
         game.winningWord = matchingWord;
         console.log(`Game ${gameId} - GAME OVER! Winning word: ${matchingWord}`);
         
-        // Update game in database
-        if (game.gameId) {
-          await prisma.$transaction(async (tx: any) => {
-            await tx.game.update({
-              where: { id: game.gameId },
-              data: {
-                status: 'COMPLETED',
-                endedAt: new Date(),
-                metadata: { winningWord: matchingWord }
-              } as any
-            });
-            
-            // Update lobby status
-            await tx.lobby.update({
-              where: { id: game.lobbyId },
-              data: { status: 'FINISHED' }
-            });
-          });
-        }
-        
         // Notify all players
         io.to(gameId).emit('gameOver', matchingWord);
       }
+      
+      // Queue database operations
+      persistGameState(game, player, guess, gameCompleted, matchingWord);
       
       // Send updated game state to all players
       io.to(gameId).emit('gameState', game);
@@ -524,13 +688,16 @@ io.on('connection', (socket) => {
             const player = game.players[playerIndex];
             console.log(`Removing player ${player.name} from game ${gameId}`);
             
-            // Update player's last active time in database
+            // Queue player update
             if (player.dbId) {
-              await prisma.$transaction(async (tx: any) => {
-                await tx.player.update({
-                  where: { id: player.dbId },
-                  data: { lastActiveAt: new Date() } as any
-                });
+              queueDbOperation({
+                type: 'playerUpdate',
+                data: {
+                  playerId: player.dbId,
+                  data: { lastActiveAt: new Date() }
+                },
+                retryCount: 0,
+                priority: 0 // Low priority
               });
             }
             
@@ -541,13 +708,16 @@ io.on('connection', (socket) => {
               console.log(`No players left in game ${gameId}, removing game`);
               games.delete(gameId);
               
-              // Update lobby status in database
+              // Queue lobby update
               if (game.lobbyId) {
-                await prisma.$transaction(async (tx: any) => {
-                  await tx.lobby.update({
-                    where: { id: game.lobbyId },
+                queueDbOperation({
+                  type: 'lobbyUpdate',
+                  data: {
+                    lobbyId: game.lobbyId,
                     data: { status: 'ABANDONED' }
-                  });
+                  },
+                  retryCount: 0,
+                  priority: 0 // Low priority
                 });
               }
             } else {
@@ -555,13 +725,16 @@ io.on('connection', (socket) => {
               if (game.status !== 'COMPLETED') {
                 game.status = 'WAITING';
                 
-                // Update lobby status in database
+                // Queue lobby update
                 if (game.lobbyId) {
-                  await prisma.$transaction(async (tx: any) => {
-                    await tx.lobby.update({
-                      where: { id: game.lobbyId },
+                  queueDbOperation({
+                    type: 'lobbyUpdate',
+                    data: {
+                      lobbyId: game.lobbyId,
                       data: { status: 'WAITING' }
-                    });
+                    },
+                    retryCount: 0,
+                    priority: 0 // Low priority
                   });
                 }
               }
@@ -615,13 +788,16 @@ io.on('connection', (socket) => {
             const player = game.players[playerIndex];
             console.log(`Player ${player.name} disconnected from game ${gameId}`);
             
-            // Update player's last active time in database
+            // Queue player update
             if (player.dbId) {
-              await prisma.$transaction(async (tx: any) => {
-                await tx.player.update({
-                  where: { id: player.dbId },
-                  data: { lastActiveAt: new Date() } as any
-                });
+              queueDbOperation({
+                type: 'playerUpdate',
+                data: {
+                  playerId: player.dbId,
+                  data: { lastActiveAt: new Date() }
+                },
+                retryCount: 0,
+                priority: 0 // Low priority
               });
             }
             
@@ -632,13 +808,16 @@ io.on('connection', (socket) => {
               console.log(`No players left in game ${gameId}, removing game`);
               games.delete(gameId);
               
-              // Update lobby status in database
+              // Queue lobby update
               if (game.lobbyId) {
-                await prisma.$transaction(async (tx: any) => {
-                  await tx.lobby.update({
-                    where: { id: game.lobbyId },
+                queueDbOperation({
+                  type: 'lobbyUpdate',
+                  data: {
+                    lobbyId: game.lobbyId,
                     data: { status: 'ABANDONED' }
-                  });
+                  },
+                  retryCount: 0,
+                  priority: 0 // Low priority
                 });
               }
             } else {
@@ -646,13 +825,16 @@ io.on('connection', (socket) => {
               if (game.status !== 'COMPLETED') {
                 game.status = 'WAITING';
                 
-                // Update lobby status in database
+                // Queue lobby update
                 if (game.lobbyId) {
-                  await prisma.$transaction(async (tx: any) => {
-                    await tx.lobby.update({
-                      where: { id: game.lobbyId },
+                  queueDbOperation({
+                    type: 'lobbyUpdate',
+                    data: {
+                      lobbyId: game.lobbyId,
                       data: { status: 'WAITING' }
-                    });
+                    },
+                    retryCount: 0,
+                    priority: 0 // Low priority
                   });
                 }
               }
@@ -689,19 +871,22 @@ setInterval(async () => {
         console.log(`Cleaning up old game: ${gameId}`);
         games.delete(gameId);
         
-        // Update lobby status in database
+        // Queue lobby update
         if (game.lobbyId) {
-          await prisma.$transaction(async (tx: any) => {
-            await tx.lobby.update({
-              where: { id: game.lobbyId },
+          queueDbOperation({
+            type: 'lobbyUpdate',
+            data: {
+              lobbyId: game.lobbyId,
               data: { status: 'ABANDONED' }
-            });
+            },
+            retryCount: 0,
+            priority: 0 // Low priority
           });
         }
       }
     });
     
-    // Also clean up abandoned lobbies in the database
+    // Clean up abandoned lobbies in the database (do this directly, not queued)
     await prisma.$transaction(async (tx: any) => {
       await tx.lobby.updateMany({
         where: {
@@ -721,6 +906,9 @@ setInterval(async () => {
     console.error('Error cleaning up old games:', error);
   }
 }, 60 * 60 * 1000);
+
+// Start the batch processor
+startBatchProcessor();
 
 // Start the server
 const PORT = process.env.PORT || 4000;
