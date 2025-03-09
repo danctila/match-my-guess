@@ -182,7 +182,7 @@ export default function GamePage() {
 
         {/* Players */}
         <div className="mb-6">
-          <h3 className="text-lg font-semibold mb-2">Players</h3>
+          <h3 className="text-lg font-semibold mb-2 text-gray-900">Players</h3>
           <div className="grid grid-cols-2 gap-4">
             {gameState.players.map((player) => (
               <div
@@ -231,7 +231,7 @@ export default function GamePage() {
                     ? "Enter your secret word"
                     : "Make a guess"
                 }
-                className="flex-1 px-4 py-2 border-2 border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                className="flex-1 px-4 py-2 border-2 border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 text-gray-900"
                 autoFocus
               />
               <button
@@ -247,7 +247,9 @@ export default function GamePage() {
         {/* Guesses */}
         {gameState.status === "PLAYING" && (
           <div>
-            <h3 className="text-lg font-semibold mb-2">Recent Guesses</h3>
+            <h3 className="text-lg font-semibold mb-2 text-gray-900">
+              Recent Guesses
+            </h3>
             {gameState.guesses.length === 0 ? (
               <p className="text-gray-500">No guesses yet. Be the first!</p>
             ) : (
