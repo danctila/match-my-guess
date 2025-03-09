@@ -4,6 +4,7 @@ import { Server } from 'socket.io';
 import cors from 'cors';
 import { v4 as uuidv4 } from 'uuid';
 import { PrismaClient, Prisma } from '@prisma/client';
+import { GameFactory } from './games/GameFactory';
 
 // Initialize Prisma client with proper type
 const prisma = new PrismaClient() as PrismaClient & {
@@ -257,25 +258,42 @@ const io = new Server(httpServer, {
   pingInterval: 25000
 });
 
+// Initialize the GameFactory with dependencies
+GameFactory.initialize(prisma, io);
+
 // Get available games for lobby
-function getAvailableGames(): GameListItem[] {
-  const availableGames: GameListItem[] = [];
-  
-  Array.from(games.entries()).forEach(([gameId, game]) => {
-    // Only show games in WAITING status and with less than 2 players
-    if (game.status === 'WAITING' && game.players.length < 2) {
-      availableGames.push({
-        id: gameId,
-        title: game.title,
-        players: game.players.length,
-        host: game.players[0]?.name || 'Unknown',
-        status: game.status
-      });
-    }
-  });
-  
-  console.log(`Available games: ${availableGames.length}`);
-  return availableGames;
+async function getAvailableGames(): Promise<GameListItem[]> {
+  try {
+    // Query the database for available games
+    const games = await prisma.$queryRaw<any[]>`
+      SELECT 
+        g.id, 
+        l.title, 
+        l."gameType",
+        g.status,
+        u."displayName" as "hostName",
+        (SELECT COUNT(*) FROM "Player" p WHERE p."gameId" = g.id) as "playerCount"
+      FROM "Game" g
+      JOIN "Lobby" l ON g."lobbyId" = l.id
+      JOIN "User" u ON l."hostId" = u.id
+      WHERE g.status IN ('IN_PROGRESS', 'WAITING')
+      AND l.status IN ('WAITING', 'READY', 'IN_GAME')
+      ORDER BY g."createdAt" DESC
+      LIMIT 20
+    `;
+    
+    return games.map(game => ({
+      id: game.id,
+      title: game.title,
+      players: parseInt(game.playerCount),
+      host: game.hostName,
+      status: game.status,
+      gameType: game.gameType
+    }));
+  } catch (error) {
+    console.error('Error getting available games:', error);
+    return [];
+  }
 }
 
 // Check for matching guesses
@@ -310,463 +328,304 @@ function checkForMatchingGuess(game: Game): string | null {
 
 // Socket.IO connection handler
 io.on('connection', (socket) => {
-  console.log(`Player connected: ${socket.id}`);
+  console.log(`New connection: ${socket.id}`);
   
-  // Send the list of available games to the newly connected client
-  socket.emit('gameList', getAvailableGames());
+  let currentPlayer: Player | null = null;
+  let currentGame: Game | null = null;
   
   // Create a new game
-  socket.on('createGame', async (playerName, gameTitle, callback) => {
+  socket.on('createGame', async (playerName, gameTitle, gameType = 'WORD_MATCH', callback) => {
     try {
-      const gameId = uuidv4();
-      
-      // Create a temporary user or get existing one
-      const user = await prisma.$transaction(async (tx: any) => {
-        return tx.user.upsert({
-          where: { username: playerName.toLowerCase() },
-          update: { displayName: playerName },
-          create: {
-            username: playerName.toLowerCase(),
-            displayName: playerName
-          }
-        });
+      // Create a new user or find existing one
+      const user = await prisma.user.upsert({
+        where: { username: playerName.toLowerCase() },
+        update: {},
+        create: {
+          username: playerName.toLowerCase(),
+          displayName: playerName
+        }
       });
       
-      // Create a lobby in the database
-      const lobby = await prisma.$transaction(async (tx: any) => {
-        return tx.lobby.create({
-          data: {
-            id: gameId, // Use the same ID for both in-memory and DB
-            title: gameTitle || `${playerName}'s Game`,
-            gameType: 'WORD_MATCH',
-            status: 'WAITING',
-            hostId: user.id,
-            maxPlayers: 2
-          }
-        });
+      // Create a new lobby
+      const lobby = await prisma.lobby.create({
+        data: {
+          title: gameTitle || 'New Game',
+          gameType: gameType as any,
+          host: { connect: { id: user.id } }
+        }
       });
       
-      // Create a player in the database
-      const dbPlayer = await prisma.$transaction(async (tx: any) => {
-        return tx.player.create({
-          data: {
-            user: { connect: { id: user.id } },
-            lobby: { connect: { id: lobby.id } },
-            metadata: {},
-            isReady: false
-          } as any
-        });
+      // Create a new game
+      const game = await prisma.game.create({
+        data: {
+          gameType: gameType as any,
+          lobby: { connect: { id: lobby.id } },
+          config: { maxPlayers: 2 },
+          metadata: {}
+        }
       });
       
-      const player: Player = {
-        id: uuidv4(),
-        name: playerName,
+      // Create a player record
+      const player = await prisma.player.create({
+        data: {
+          user: { connect: { id: user.id } },
+          lobby: { connect: { id: lobby.id } },
+          game: { connect: { id: game.id } },
+          metadata: {}
+        }
+      });
+      
+      // Initialize the game instance
+      const gameInstance = await GameFactory.createGame(game.id, gameType, {
+        title: gameTitle || 'New Game',
+        maxPlayers: 2
+      });
+      
+      // Add the player to the game
+      await gameInstance.addPlayer(player.id, user.displayName, true);
+      
+      // Register socket events for this game type
+      gameInstance.registerSocketEvents(socket, player.id);
+      
+      // Store player and game info in socket session
+      currentPlayer = {
+        id: player.id,
+        name: user.displayName,
         socketId: socket.id,
         secretWord: '',
         isHost: true,
-        dbId: dbPlayer.id
+        dbId: player.id
       };
       
-      const game: Game = {
-        id: gameId,
-        title: gameTitle || `${playerName}'s Game`,
-        status: 'WAITING',
-        players: [player],
-        guesses: [],
-        winningWord: null,
-        createdAt: new Date(),
-        lobbyId: lobby.id
-      };
+      // Join the game room
+      socket.join(`game:${game.id}`);
       
-      // Store game and player mapping
-      games.set(gameId, game);
-      playerToGame.set(socket.id, gameId);
+      // Return the game ID to the client
+      callback({ success: true, gameId: game.id });
       
-      // Join the Socket.IO room
-      socket.join(gameId);
-      console.log(`Game created: ${gameId} by ${playerName}`);
-      
-      // Send game state to the player
-      socket.emit('gameState', game);
-      
-      // Send updated game list to everyone
-      io.emit('gameList', getAvailableGames());
-      
-      callback(gameId);
     } catch (error) {
       console.error('Error creating game:', error);
-      callback(null);
+      callback({ success: false, error: 'Failed to create game' });
     }
   });
   
   // Join an existing game
   socket.on('joinGame', async (gameId, playerName, callback) => {
     try {
-      console.log(`Join request: ${playerName} (${socket.id}) trying to join game ${gameId}`);
-      
-      // Check if player is already in this game
-      const currentGameId = playerToGame.get(socket.id);
-      if (currentGameId === gameId) {
-        console.log(`Player ${playerName} (${socket.id}) is already in game ${gameId}`);
-        // Player is already in this game, send the current game state
-        const game = games.get(gameId);
-        if (game) {
-          socket.emit('gameState', game);
-          callback(true);
-          return;
+      // Find the game
+      const game = await prisma.game.findUnique({
+        where: { id: gameId },
+        include: {
+          lobby: true
         }
-      }
+      });
       
-      const game = games.get(gameId);
-      
-      // Game not found
       if (!game) {
-        console.log(`Game ${gameId} not found`);
         socket.emit('gameNotFound');
-        callback(false);
+        callback({ success: false, error: 'Game not found' });
         return;
       }
       
-      // Game is full or not in waiting state
-      if (game.players.length >= 2 || game.status !== 'WAITING') {
-        console.log(`Game ${gameId} is full or not in waiting state. Players: ${game.players.length}, Status: ${game.status}`);
+      // Check if game is joinable
+      if (game.status !== 'IN_PROGRESS' && game.status !== 'WAITING') {
+        callback({ success: false, error: 'Game is not joinable' });
+        return;
+      }
+      
+      // Count existing players
+      const playerCount = await prisma.player.count({
+        where: { gameId }
+      });
+      
+      // Check if game is full
+      const maxPlayers = (game.config as any).maxPlayers || 2;
+      if (playerCount >= maxPlayers) {
         socket.emit('gameFull');
-        callback(false);
+        callback({ success: false, error: 'Game is full' });
         return;
       }
       
-      // Create a temporary user or get existing one
-      const user = await prisma.$transaction(async (tx: any) => {
-        return tx.user.upsert({
-          where: { username: playerName.toLowerCase() },
-          update: { displayName: playerName },
-          create: {
-            username: playerName.toLowerCase(),
-            displayName: playerName
-          }
-        });
+      // Create a new user or find existing one
+      const user = await prisma.user.upsert({
+        where: { username: playerName.toLowerCase() },
+        update: {},
+        create: {
+          username: playerName.toLowerCase(),
+          displayName: playerName
+        }
       });
       
-      // Create a player in the database
-      const dbPlayer = await prisma.$transaction(async (tx: any) => {
-        return tx.player.create({
-          data: {
-            user: { connect: { id: user.id } },
-            lobby: { connect: { id: game.lobbyId! } },
-            metadata: {},
-            isReady: false
-          } as any
-        });
+      // Create a player record
+      const player = await prisma.player.create({
+        data: {
+          user: { connect: { id: user.id } },
+          lobby: { connect: { id: game.lobbyId } },
+          game: { connect: { id: game.id } },
+          metadata: {}
+        }
       });
       
-      // Create player and add to game
-      const player: Player = {
-        id: uuidv4(),
-        name: playerName,
+      // Get the game instance
+      const gameInstance = await GameFactory.getGame(game.id) || 
+        await GameFactory.createGame(game.id, game.gameType, game.config);
+      
+      // Add the player to the game
+      await gameInstance.addPlayer(player.id, user.displayName, false);
+      
+      // Register socket events for this game type
+      gameInstance.registerSocketEvents(socket, player.id);
+      
+      // Store player and game info in socket session
+      currentPlayer = {
+        id: player.id,
+        name: user.displayName,
         socketId: socket.id,
         secretWord: '',
         isHost: false,
-        dbId: dbPlayer.id
+        dbId: player.id
       };
       
-      game.players.push(player);
-      playerToGame.set(socket.id, gameId);
+      // Join the game room
+      socket.join(`game:${game.id}`);
       
-      // Join the Socket.IO room
-      socket.join(gameId);
-      console.log(`${playerName} (${socket.id}) joined game ${gameId}. Total players: ${game.players.length}`);
+      // Return success to the client
+      callback({ success: true });
       
-      // If we now have 2 players, update game status
-      if (game.players.length === 2) {
-        game.status = 'SETTING_WORDS';
-        console.log(`Game ${gameId} now has 2 players, updating status to SETTING_WORDS`);
-        
-        // Queue lobby status update
-        queueDbOperation({
-          type: 'lobbyUpdate',
-          data: {
-            lobbyId: game.lobbyId,
-            data: { status: 'READY' }
-          },
-          retryCount: 0,
-          priority: 1
-        });
-      }
-      
-      // Send game state to everyone in the room
-      io.to(gameId).emit('gameState', game);
-      
-      // Send updated game list to everyone
-      io.emit('gameList', getAvailableGames());
-      
-      callback(true);
     } catch (error) {
       console.error('Error joining game:', error);
-      callback(false);
+      callback({ success: false, error: 'Failed to join game' });
     }
   });
   
-  // Set secret word
+  // Set secret word (for Match My Guess game)
   socket.on('setSecretWord', async (word, callback) => {
     try {
-      const gameId = playerToGame.get(socket.id);
-      if (!gameId) {
-        console.log(`No game found for player ${socket.id}`);
-        callback(false);
+      if (!currentPlayer || !currentPlayer.dbId) {
+        callback({ success: false, error: 'Not in a game' });
         return;
       }
       
-      const game = games.get(gameId);
-      if (!game) {
-        console.log(`Game ${gameId} not found`);
-        callback(false);
-        return;
-      }
-      
-      // Find player and set word
-      const player = game.players.find(p => p.socketId === socket.id);
-      if (!player) {
-        console.log(`Player not found in game ${gameId}`);
-        callback(false);
-        return;
-      }
-      
-      console.log(`Player ${player.name} (${socket.id}) setting secret word in game ${gameId}`);
-      player.secretWord = word.toLowerCase().trim();
-      
-      // Queue player metadata update
-      if (player.dbId) {
-        queueDbOperation({
-          type: 'playerUpdate',
-          data: {
-            playerId: player.dbId,
-            data: {
-              metadata: { secretWord: player.secretWord },
-              isReady: true
-            }
-          },
-          retryCount: 0,
-          priority: 1
-        });
-      }
-      
-      // Check if all players have set their words
-      const allPlayersReady = game.players.every(p => p.secretWord);
-      if (allPlayersReady && game.status === 'SETTING_WORDS') {
-        game.status = 'PLAYING';
-        console.log(`Game ${gameId} - All players have set words, moving to PLAYING state`);
-        
-        // Create a game in the database immediately (this is important enough to not batch)
-        const dbGame = await prisma.$transaction(async (tx: any) => {
-          const newGame = await tx.game.create({
-            data: {
-              lobby: { connect: { id: game.lobbyId! } },
-              gameType: 'WORD_MATCH',
-              status: 'IN_PROGRESS',
-              config: { maxPlayers: 2 },
-              metadata: { winningWord: null }
-            } as any
-          });
-          
-          // Update lobby status
-          await tx.lobby.update({
-            where: { id: game.lobbyId },
-            data: { status: 'IN_GAME' }
-          });
-          
-          // Update players to link them to the game
-          for (const p of game.players) {
-            if (p.dbId) {
-              await tx.player.update({
-                where: { id: p.dbId },
-                data: { game: { connect: { id: newGame.id } } } as any
-              });
-            }
-          }
-          
-          return newGame;
-        });
-        
-        // Update game reference
-        game.gameId = dbGame.id;
-      }
-      
-      // Send updated game state to all players
-      io.to(gameId).emit('gameState', game);
-      
-      callback(true);
-    } catch (error) {
-      console.error('Error setting secret word:', error);
-      callback(false);
-    }
-  });
-  
-  // Make a guess
-  socket.on('makeGuess', async (word, callback) => {
-    try {
-      const gameId = playerToGame.get(socket.id);
-      if (!gameId) {
-        callback(false);
-        return;
-      }
-      
-      const game = games.get(gameId);
-      if (!game || game.status !== 'PLAYING') {
-        callback(false);
-        return;
-      }
-      
-      const player = game.players.find(p => p.socketId === socket.id);
-      if (!player) {
-        callback(false);
-        return;
-      }
-      
-      // Add guess with a unique ID
-      const guess: Guess = {
-        id: uuidv4(), // Generate a unique ID for the guess
-        playerId: player.id,
-        playerName: player.name,
-        word: word.toLowerCase().trim(),
-        timestamp: new Date()
-      };
-      
-      console.log(`Player ${player.name} guessed: ${guess.word} in game ${gameId}`);
-      game.guesses.push(guess);
-      
-      // Broadcast the guess to all players in the room
-      io.to(gameId).emit('newGuess', {
-        id: guess.id,
-        playerId: guess.playerId,
-        playerName: guess.playerName,
-        word: guess.word,
-        timestamp: guess.timestamp
+      // Get the player's current game
+      const player = await prisma.player.findUnique({
+        where: { id: currentPlayer.dbId },
+        include: {
+          game: true
+        }
       });
       
-      // Check for matching guesses
-      const matchingWord = checkForMatchingGuess(game);
-      let gameCompleted = false;
-      
-      if (matchingWord) {
-        gameCompleted = true;
-        game.status = 'COMPLETED';
-        game.winningWord = matchingWord;
-        console.log(`Game ${gameId} - GAME OVER! Winning word: ${matchingWord}`);
-        
-        // Notify all players
-        io.to(gameId).emit('gameOver', matchingWord);
+      if (!player || !player.game) {
+        callback({ success: false, error: 'Game not found' });
+        return;
       }
       
-      // Queue database operations
-      persistGameState(game, player, guess, gameCompleted, matchingWord);
+      // Get the game instance
+      const gameInstance = GameFactory.getGame(player.game.id);
+      if (!gameInstance) {
+        callback({ success: false, error: 'Game instance not found' });
+        return;
+      }
       
-      // Send updated game state to all players
-      io.to(gameId).emit('gameState', game);
+      // Set the player ready with their secret word
+      await gameInstance.setPlayerReady(player.id, { secretWord: word });
       
-      callback(true);
+      // Update the current player's secret word
+      currentPlayer.secretWord = word;
+      
+      callback({ success: true });
+      
+    } catch (error) {
+      console.error('Error setting secret word:', error);
+      callback({ success: false, error: 'Failed to set secret word' });
+    }
+  });
+  
+  // Make a guess/move
+  socket.on('makeGuess', async (word, callback) => {
+    try {
+      if (!currentPlayer || !currentPlayer.dbId) {
+        callback({ success: false, error: 'Not in a game' });
+        return;
+      }
+      
+      // Get the player's current game
+      const player = await prisma.player.findUnique({
+        where: { id: currentPlayer.dbId },
+        include: {
+          game: true
+        }
+      });
+      
+      if (!player || !player.game) {
+        callback({ success: false, error: 'Game not found' });
+        return;
+      }
+      
+      // Get the game instance
+      const gameInstance = GameFactory.getGame(player.game.id);
+      if (!gameInstance) {
+        callback({ success: false, error: 'Game instance not found' });
+        return;
+      }
+      
+      // Process the move
+      const result = await gameInstance.processMove(player.id, { word });
+      
+      callback({ success: true });
+      
     } catch (error) {
       console.error('Error making guess:', error);
-      callback(false);
+      callback({ success: false, error: 'Failed to make guess' });
     }
   });
   
-  // Leave game
+  // Leave the current game
   socket.on('leaveGame', async (callback) => {
     try {
-      const gameId = playerToGame.get(socket.id);
-      
-      if (gameId) {
-        socket.leave(gameId);
-        console.log(`Player ${socket.id} leaving game ${gameId}`);
-        
-        const game = games.get(gameId);
-        if (game) {
-          // Remove player from game
-          const playerIndex = game.players.findIndex(p => p.socketId === socket.id);
-          
-          if (playerIndex !== -1) {
-            const player = game.players[playerIndex];
-            console.log(`Removing player ${player.name} from game ${gameId}`);
-            
-            // Queue player update
-            if (player.dbId) {
-              queueDbOperation({
-                type: 'playerUpdate',
-                data: {
-                  playerId: player.dbId,
-                  data: { lastActiveAt: new Date() }
-                },
-                retryCount: 0,
-                priority: 0 // Low priority
-              });
-            }
-            
-            game.players.splice(playerIndex, 1);
-            
-            // If no players left, remove the game
-            if (game.players.length === 0) {
-              console.log(`No players left in game ${gameId}, removing game`);
-              games.delete(gameId);
-              
-              // Queue lobby update
-              if (game.lobbyId) {
-                queueDbOperation({
-                  type: 'lobbyUpdate',
-                  data: {
-                    lobbyId: game.lobbyId,
-                    data: { status: 'ABANDONED' }
-                  },
-                  retryCount: 0,
-                  priority: 0 // Low priority
-                });
-              }
-            } else {
-              // Otherwise, update game state
-              if (game.status !== 'COMPLETED') {
-                game.status = 'WAITING';
-                
-                // Queue lobby update
-                if (game.lobbyId) {
-                  queueDbOperation({
-                    type: 'lobbyUpdate',
-                    data: {
-                      lobbyId: game.lobbyId,
-                      data: { status: 'WAITING' }
-                    },
-                    retryCount: 0,
-                    priority: 0 // Low priority
-                  });
-                }
-              }
-              
-              // Make the first remaining player the host
-              if (game.players.length > 0) {
-                game.players[0].isHost = true;
-              }
-              
-              // Send updated game state to remaining players
-              io.to(gameId).emit('gameState', game);
-            }
-          }
-        }
-        
-        playerToGame.delete(socket.id);
-        
-        // Send updated game list to everyone
-        io.emit('gameList', getAvailableGames());
+      if (!currentPlayer || !currentPlayer.dbId) {
+        callback({ success: false, error: 'Not in a game' });
+        return;
       }
       
-      callback();
+      // Get the player's current game
+      const player = await prisma.player.findUnique({
+        where: { id: currentPlayer.dbId },
+        include: {
+          game: true
+        }
+      });
+      
+      if (!player || !player.game) {
+        callback({ success: false, error: 'Game not found' });
+        return;
+      }
+      
+      // Get the game instance
+      const gameInstance = GameFactory.getGame(player.game.id);
+      if (gameInstance) {
+        // Remove the player from the game
+        await gameInstance.removePlayer(player.id);
+      }
+      
+      // Leave the game room
+      socket.leave(`game:${player.game.id}`);
+      
+      // Clear the current player and game
+      currentPlayer = null;
+      
+      callback({ success: true });
+      
     } catch (error) {
       console.error('Error leaving game:', error);
-      callback();
+      callback({ success: false, error: 'Failed to leave game' });
     }
   });
   
-  // Get game list
-  socket.on('getGameList', () => {
+  // Get list of available games
+  socket.on('getGameList', async () => {
     try {
-      socket.emit('gameList', getAvailableGames());
+      // Get all active games
+      const games = await getAvailableGames();
+      socket.emit('gameList', games);
     } catch (error) {
       console.error('Error getting game list:', error);
     }
@@ -775,85 +634,25 @@ io.on('connection', (socket) => {
   // Handle disconnection
   socket.on('disconnect', async () => {
     try {
-      console.log(`Player disconnected: ${socket.id}`);
+      console.log(`Disconnected: ${socket.id}`);
       
-      const gameId = playerToGame.get(socket.id);
-      if (gameId) {
-        const game = games.get(gameId);
-        if (game) {
-          // Remove player from game
-          const playerIndex = game.players.findIndex(p => p.socketId === socket.id);
-          
-          if (playerIndex !== -1) {
-            const player = game.players[playerIndex];
-            console.log(`Player ${player.name} disconnected from game ${gameId}`);
-            
-            // Queue player update
-            if (player.dbId) {
-              queueDbOperation({
-                type: 'playerUpdate',
-                data: {
-                  playerId: player.dbId,
-                  data: { lastActiveAt: new Date() }
-                },
-                retryCount: 0,
-                priority: 0 // Low priority
-              });
-            }
-            
-            game.players.splice(playerIndex, 1);
-            
-            // If no players left, remove the game
-            if (game.players.length === 0) {
-              console.log(`No players left in game ${gameId}, removing game`);
-              games.delete(gameId);
-              
-              // Queue lobby update
-              if (game.lobbyId) {
-                queueDbOperation({
-                  type: 'lobbyUpdate',
-                  data: {
-                    lobbyId: game.lobbyId,
-                    data: { status: 'ABANDONED' }
-                  },
-                  retryCount: 0,
-                  priority: 0 // Low priority
-                });
-              }
-            } else {
-              // Otherwise, update game state
-              if (game.status !== 'COMPLETED') {
-                game.status = 'WAITING';
-                
-                // Queue lobby update
-                if (game.lobbyId) {
-                  queueDbOperation({
-                    type: 'lobbyUpdate',
-                    data: {
-                      lobbyId: game.lobbyId,
-                      data: { status: 'WAITING' }
-                    },
-                    retryCount: 0,
-                    priority: 0 // Low priority
-                  });
-                }
-              }
-              
-              // Make the first remaining player the host
-              if (game.players.length > 0) {
-                game.players[0].isHost = true;
-              }
-              
-              // Send updated game state to remaining players
-              io.to(gameId).emit('gameState', game);
-            }
+      if (currentPlayer && currentPlayer.dbId) {
+        // Get the player's current game
+        const player = await prisma.player.findUnique({
+          where: { id: currentPlayer.dbId },
+          include: {
+            game: true
+          }
+        });
+        
+        if (player && player.game) {
+          // Get the game instance
+          const gameInstance = GameFactory.getGame(player.game.id);
+          if (gameInstance) {
+            // Remove the player from the game
+            await gameInstance.removePlayer(player.id);
           }
         }
-        
-        playerToGame.delete(socket.id);
-        
-        // Send updated game list to everyone
-        io.emit('gameList', getAvailableGames());
       }
     } catch (error) {
       console.error('Error handling disconnect:', error);
