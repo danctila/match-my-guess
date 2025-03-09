@@ -13,47 +13,120 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-model GameSession {
+// User model for persistent user data
+model User {
   id            String    @id @default(cuid())
-  title         String    @default("New Game")
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
-  status        GameStatus @default(WAITING_FOR_PLAYERS)
+  username      String    @unique
+  displayName   String
+  // Authentication fields can be added here if needed
+  // email       String?   @unique
+  // password    String?
+  
+  // Relations
   players       Player[]
-  guesses       Guess[]
-  winningWord   String?   // Set when game is complete
-  completedAt   DateTime?
+  hostedLobbies Lobby[]   @relation("LobbyHost")
 }
 
+// Lobby model for game session management
+model Lobby {
+  id            String    @id @default(cuid())
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  title         String    @default("New Game")
+  gameType      GameType  @default(WORD_MATCH)
+  status        LobbyStatus @default(WAITING)
+  maxPlayers    Int       @default(2)
+  
+  // Relations
+  hostId        String    // Required host user
+  host          User      @relation("LobbyHost", fields: [hostId], references: [id])
+  game          Game?     // Optional until game starts
+  players       Player[]
+  
+  @@index([hostId])
+}
+
+// Game model for actual gameplay state
+model Game {
+  id            String    @id @default(cuid())
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  startedAt     DateTime  @default(now())
+  endedAt       DateTime?
+  gameType      GameType
+  status        GameStatus @default(IN_PROGRESS)
+  config        Json      // Flexible game configuration
+  metadata      Json      // Game-specific metadata (e.g., winning word)
+  
+  // Relations
+  lobbyId       String    @unique  // One-to-one with Lobby
+  lobby         Lobby     @relation(fields: [lobbyId], references: [id])
+  players       Player[]
+  moves         Move[]
+  
+  @@index([lobbyId])
+}
+
+// Player model for game participation
 model Player {
   id            String    @id @default(cuid())
-  sessionId     String
-  session       GameSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
   joinedAt      DateTime  @default(now())
-  nickname      String
-  secretWord    String?   // Allow null until player sets their word
-  isHost        Boolean   @default(false)
-  guesses       Guess[]
+  lastActiveAt  DateTime  @updatedAt
+  isReady       Boolean   @default(false)
+  metadata      Json      // Player game-specific data (e.g., secret word)
   
-  @@index([sessionId])
+  // Relations
+  userId        String
+  user          User      @relation(fields: [userId], references: [id])
+  lobbyId       String
+  lobby         Lobby     @relation(fields: [lobbyId], references: [id])
+  gameId        String?
+  game          Game?     @relation(fields: [gameId], references: [id])
+  moves         Move[]
+  
+  @@unique([userId, lobbyId]) // One player instance per user per lobby
+  @@index([userId])
+  @@index([lobbyId])
+  @@index([gameId])
 }
 
-model Guess {
+// Move model for game actions (replaces Guess)
+model Move {
   id            String    @id @default(cuid())
-  sessionId     String
-  playerId      String
-  word          String
   createdAt     DateTime  @default(now())
-  session       GameSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
-  player        Player    @relation(fields: [playerId], references: [id], onDelete: Cascade)
-
-  @@index([sessionId])
+  moveType      String    // e.g., "guess", "reveal", etc.
+  data          Json      // Flexible move data
+  
+  // Relations
+  gameId        String
+  game          Game      @relation(fields: [gameId], references: [id])
+  playerId      String
+  player        Player    @relation(fields: [playerId], references: [id])
+  
+  @@index([gameId])
   @@index([playerId])
 }
 
+enum GameType {
+  WORD_MATCH     // Current game type
+  // Future game types can be added here
+  // WORD_CHAIN
+  // CROSSWORD
+  // etc.
+}
+
 enum GameStatus {
-  WAITING_FOR_PLAYERS // Waiting for players to join
-  SETTING_WORDS      // Players are setting their secret words
-  ACTIVE             // Game is in progress
-  COMPLETED          // Game has been won
+  IN_PROGRESS
+  COMPLETED
+  ABANDONED
+}
+
+enum LobbyStatus {
+  WAITING       // Waiting for players
+  READY         // All players ready
+  IN_GAME       // Game in progress
+  FINISHED      // Game completed
+  ABANDONED     // Lobby abandoned
 }
