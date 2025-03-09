@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
-import { useSocket } from "@/hooks/useSocket";
+import { useSocket, GameType } from "@/hooks/useSocket";
 
 export default function Home() {
   const router = useRouter();
@@ -12,10 +12,13 @@ export default function Home() {
     lobbyList,
     createGame,
     refreshGameList,
+    getSupportedGameTypes,
   } = useSocket();
 
   const [playerName, setPlayerName] = useState("");
   const [gameTitle, setGameTitle] = useState("");
+  const [selectedGameType, setSelectedGameType] =
+    useState<GameType>("WORD_MATCH");
   const [isCreating, setIsCreating] = useState(false);
   const [isJoining, setIsJoining] = useState(false);
   const [error, setError] = useState("");
@@ -50,7 +53,8 @@ export default function Home() {
       // Create a new game
       const gameId = await createGame(
         playerName.trim(),
-        gameTitle.trim() || `${playerName}'s Game`
+        gameTitle.trim() || `${playerName}'s Game`,
+        selectedGameType
       );
 
       if (gameId) {
@@ -87,6 +91,18 @@ export default function Home() {
     }
   };
 
+  // Get game type display name
+  const getGameTypeDisplayName = (gameType: GameType): string => {
+    switch (gameType) {
+      case "WORD_MATCH":
+        return "Match My Guess";
+      case "WORD_BOMB":
+        return "Word Bomb";
+      default:
+        return gameType;
+    }
+  };
+
   return (
     <main className="min-h-screen bg-gray-100 flex flex-col p-4">
       <div className="max-w-4xl w-full mx-auto">
@@ -95,8 +111,7 @@ export default function Home() {
             Match My Guess
           </h1>
           <p className="text-gray-700">
-            A multiplayer word guessing game. Keep guessing until you match your
-            opponent's word!
+            A multiplayer word guessing game platform with different game modes!
           </p>
         </div>
 
@@ -143,6 +158,36 @@ export default function Home() {
                   placeholder={`${playerName}'s Game`}
                   className="w-full px-4 py-2 border-2 border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 text-gray-900"
                 />
+              </div>
+
+              <div className="space-y-2">
+                <label
+                  htmlFor="gameType"
+                  className="block text-sm font-medium text-gray-800"
+                >
+                  Game Type
+                </label>
+                <select
+                  id="gameType"
+                  value={selectedGameType}
+                  onChange={(e) =>
+                    setSelectedGameType(e.target.value as GameType)
+                  }
+                  className="w-full px-4 py-2 border-2 border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 text-gray-900"
+                >
+                  {getSupportedGameTypes().map((gameType) => (
+                    <option key={gameType} value={gameType}>
+                      {getGameTypeDisplayName(gameType as GameType)}
+                    </option>
+                  ))}
+                </select>
+                <p className="text-sm text-gray-600 mt-1">
+                  {selectedGameType === "WORD_MATCH"
+                    ? "Players choose secret words and guess until they match."
+                    : selectedGameType === "WORD_BOMB"
+                    ? "Take turns creating words that start with the last letter of the previous word."
+                    : "Select a game type to see its description."}
+                </p>
               </div>
 
               <button
@@ -200,7 +245,10 @@ export default function Home() {
                         {lobby.title}
                       </h3>
                       <p className="text-sm text-gray-700">
-                        Host: {lobby.host} • Players: {lobby.players}/2
+                        Host: {lobby.host} • Players: {lobby.players}/2 •
+                        <span className="ml-1 font-medium text-blue-600">
+                          {getGameTypeDisplayName(lobby.gameType)}
+                        </span>
                       </p>
                     </div>
                     <button

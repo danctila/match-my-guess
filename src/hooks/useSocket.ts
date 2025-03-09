@@ -5,12 +5,15 @@ import { io, Socket } from 'socket.io-client';
 const SOCKET_URL = process.env.NEXT_PUBLIC_SOCKET_URL || 'http://localhost:4000';
 
 // Game types
+export type GameType = 'WORD_MATCH' | 'WORD_BOMB' | string;
+
 export interface Player {
   id: string;
   name: string;
   socketId: string;
   secretWord: string; 
   isHost: boolean;
+  score?: number; // For games that track scores
 }
 
 export interface Guess {
@@ -24,10 +27,15 @@ export interface Game {
   id: string;
   title: string;
   status: 'WAITING' | 'SETTING_WORDS' | 'PLAYING' | 'COMPLETED';
+  gameType: GameType;
   players: Player[];
   guesses: Guess[];
   winningWord: string | null;
   createdAt: Date;
+  // Word Bomb specific properties
+  currentPlayerId?: string;
+  turnTimeLimit?: number;
+  winnerName?: string;
 }
 
 export interface GameListItem {
@@ -36,6 +44,7 @@ export interface GameListItem {
   players: number;
   host: string;
   status: 'WAITING' | 'SETTING_WORDS' | 'PLAYING' | 'COMPLETED';
+  gameType: GameType;
 }
 
 // Create a socket instance
@@ -48,6 +57,7 @@ export function useSocket() {
   const [gameState, setGameState] = useState<Game | null>(null);
   const [currentPlayer, setCurrentPlayer] = useState<Player | null>(null);
   const [winningWord, setWinningWord] = useState<string | null>(null);
+  const [supportedGameTypes, setSupportedGameTypes] = useState<string[]>(['WORD_MATCH', 'WORD_BOMB']);
 
   // Initialize socket connection
   useEffect(() => {
@@ -85,7 +95,7 @@ export function useSocket() {
       
       // Update current player if we have a player with matching socket ID
       if (socket) {
-        const player = state.players.find(p => p.socketId === socket.id);
+        const player = state.players.find(p => p.socketId === socket?.id);
         if (player) {
           setCurrentPlayer(player);
         }
@@ -152,14 +162,14 @@ export function useSocket() {
     if (!isConnected || !socket) return;
     
     const interval = setInterval(() => {
-      socket.emit('getGameList');
+      socket?.emit('getGameList');
     }, 3000);
     
     return () => clearInterval(interval);
   }, [isConnected]);
 
   // Create a new game
-  const createGame = useCallback((playerName: string, gameTitle: string = ''): Promise<string | null> => {
+  const createGame = useCallback((playerName: string, gameTitle: string = '', gameType: GameType = 'WORD_MATCH'): Promise<string | null> => {
     return new Promise((resolve) => {
       if (!socket || !isConnected) {
         setError('Not connected to server');
@@ -167,10 +177,13 @@ export function useSocket() {
         return;
       }
 
-      console.log(`Creating game with title: ${gameTitle || playerName + "'s Game"}`);
-      socket.emit('createGame', playerName, gameTitle, (gameId: string | null) => {
-        console.log(`Game creation result: ${gameId ? 'SUCCESS' : 'FAILED'}`);
-        resolve(gameId);
+      console.log(`Creating game with title: ${gameTitle || playerName + "'s Game"}, type: ${gameType}`);
+      socket?.emit('createGame', playerName, gameTitle, gameType, (response: { success: boolean, gameId: string | null, error?: string }) => {
+        console.log(`Game creation result: ${response.success ? 'SUCCESS' : 'FAILED'}`);
+        if (!response.success && response.error) {
+          setError(response.error);
+        }
+        resolve(response.gameId);
       });
     });
   }, [isConnected]);
@@ -185,9 +198,12 @@ export function useSocket() {
       }
 
       console.log(`Attempting to join game ${gameId} as ${playerName}`);
-      socket.emit('joinGame', gameId, playerName, (success: boolean) => {
-        console.log(`Join game result: ${success ? 'SUCCESS' : 'FAILED'}`);
-        resolve(success);
+      socket?.emit('joinGame', gameId, playerName, (response: { success: boolean, error?: string }) => {
+        console.log(`Join game result: ${response.success ? 'SUCCESS' : 'FAILED'}`);
+        if (!response.success && response.error) {
+          setError(response.error);
+        }
+        resolve(response.success);
       });
     });
   }, [isConnected]);
@@ -253,6 +269,11 @@ export function useSocket() {
     }
   }, [isConnected]);
 
+  // Get supported game types
+  const getSupportedGameTypes = useCallback((): string[] => {
+    return supportedGameTypes;
+  }, [supportedGameTypes]);
+
   return {
     socket,
     isConnected,
@@ -266,6 +287,7 @@ export function useSocket() {
     setSecretWord,
     makeGuess,
     leaveGame,
-    refreshGameList
+    refreshGameList,
+    getSupportedGameTypes
   };
 } 
