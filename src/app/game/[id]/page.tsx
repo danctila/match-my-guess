@@ -135,15 +135,15 @@ export default function GamePage() {
   }
 
   return (
-    <div className="min-h-screen bg-gray-50 p-4">
-      <div className="max-w-2xl mx-auto bg-white rounded-lg shadow-sm p-6">
+    <div className="min-h-screen bg-gray-100 p-4">
+      <div className="max-w-2xl mx-auto bg-white rounded-lg shadow-md p-6">
         <div className="flex justify-between items-center mb-6">
-          <h2 className="text-2xl font-bold text-gray-800">
+          <h2 className="text-2xl font-bold text-gray-900">
             {gameState.title}
           </h2>
           <button
             onClick={handleLeaveGame}
-            className="px-3 py-1 bg-gray-600 text-white text-sm rounded hover:bg-gray-700"
+            className="px-3 py-1 bg-red-600 text-white text-sm rounded hover:bg-red-700"
           >
             Leave Game
           </button>
@@ -153,12 +153,12 @@ export default function GamePage() {
         <div
           className={`text-center p-4 rounded-lg mb-6 ${
             gameState.status === "WAITING"
-              ? "bg-yellow-50 text-yellow-800"
+              ? "bg-yellow-100 text-yellow-900"
               : gameState.status === "SETTING_WORDS"
-              ? "bg-blue-50 text-blue-800"
+              ? "bg-blue-100 text-blue-900"
               : gameState.status === "PLAYING"
-              ? "bg-green-50 text-green-800"
-              : "bg-purple-50 text-purple-800"
+              ? "bg-green-100 text-green-900"
+              : "bg-purple-100 text-purple-900"
           }`}
         >
           {gameState.status === "WAITING" && (
@@ -189,20 +189,22 @@ export default function GamePage() {
                 key={player.id}
                 className={`p-4 rounded-lg ${
                   player.socketId === currentPlayer?.socketId
-                    ? "bg-blue-100 border border-blue-200"
-                    : "bg-gray-50 border border-gray-200"
+                    ? "bg-blue-50 border-2 border-blue-300"
+                    : "bg-gray-50 border border-gray-300"
                 }`}
               >
                 <div className="flex items-center justify-between">
-                  <span className="font-medium">{player.name}</span>
+                  <span className="font-medium text-gray-900">
+                    {player.name}
+                  </span>
                   <div className="flex gap-2">
                     {player.isHost && (
-                      <span className="text-xs bg-yellow-100 text-yellow-800 px-2 py-1 rounded">
+                      <span className="text-xs bg-yellow-200 text-yellow-900 px-2 py-1 rounded font-medium">
                         Host
                       </span>
                     )}
                     {player.secretWord && (
-                      <span className="text-xs bg-green-100 text-green-800 px-2 py-1 rounded">
+                      <span className="text-xs bg-green-200 text-green-900 px-2 py-1 rounded font-medium">
                         Ready
                       </span>
                     )}
@@ -229,12 +231,12 @@ export default function GamePage() {
                     ? "Enter your secret word"
                     : "Make a guess"
                 }
-                className="flex-1 px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                className="flex-1 px-4 py-2 border-2 border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
                 autoFocus
               />
               <button
                 type="submit"
-                className="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                className="px-6 py-2 bg-blue-600 text-white font-medium rounded-lg hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500"
               >
                 {gameState.status === "SETTING_WORDS" ? "Set Word" : "Guess"}
               </button>
