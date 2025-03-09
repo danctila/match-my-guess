@@ -194,7 +194,8 @@ async function persistGameState(
 }
 
 // Simple types
-type GameStatus = 'WAITING' | 'SETTING_WORDS' | 'PLAYING' | 'COMPLETED';
+type GameStatus = 'IN_PROGRESS' | 'COMPLETED' | 'ABANDONED';
+type LobbyStatus = 'WAITING' | 'READY' | 'IN_GAME' | 'FINISHED' | 'ABANDONED';
 
 interface Player {
   id: string;
@@ -235,6 +236,7 @@ interface GameListItem {
   players: number;
   host: string;
   status: GameStatus;
+  gameType: string;
 }
 
 // In-memory storage
@@ -276,7 +278,7 @@ async function getAvailableGames(): Promise<GameListItem[]> {
       FROM "Game" g
       JOIN "Lobby" l ON g."lobbyId" = l.id
       JOIN "User" u ON l."hostId" = u.id
-      WHERE g.status IN ('IN_PROGRESS', 'WAITING')
+      WHERE g.status = 'IN_PROGRESS'
       AND l.status IN ('WAITING', 'READY', 'IN_GAME')
       ORDER BY g."createdAt" DESC
       LIMIT 20

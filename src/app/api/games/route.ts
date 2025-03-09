@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import prisma from '@/server/prisma';
+import { getOrCreateUser, createLobby, startGame } from '../../../server/prisma';
 
 export async function POST(request: Request) {
   try {
@@ -12,12 +12,14 @@ export async function POST(request: Request) {
       );
     }
 
-    // Create a new game session
-    const game = await prisma.gameSession.create({
-      data: {
-        status: 'WAITING'
-      }
-    });
+    // Create or get the user
+    const user = await getOrCreateUser(playerName.toLowerCase(), playerName);
+
+    // Create a new lobby
+    const lobby = await createLobby(user, 'New Game');
+
+    // Start the game
+    const game = await startGame(lobby.id);
 
     return NextResponse.json({ gameId: game.id });
   } catch (error) {
