@@ -1,0 +1,3 @@
+-- AlterTable
+ALTER TABLE "Player" ALTER COLUMN "lastActiveAt" DROP DEFAULT,
+ALTER COLUMN "metadata" DROP DEFAULT;
