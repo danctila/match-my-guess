@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { getOrCreateUser, createLobby, startGame } from '../../../server/prisma';
+import { getOrCreateUser, createLobby } from '../../../server/prisma';
 
 export async function POST(request: Request) {
   try {
@@ -18,10 +18,8 @@ export async function POST(request: Request) {
     // Create a new lobby
     const lobby = await createLobby(user, 'New Game');
 
-    // Start the game
-    const game = await startGame(lobby.id);
-
-    return NextResponse.json({ gameId: game.id });
+    // Return the lobby ID instead of game ID
+    return NextResponse.json({ gameId: lobby.id });
   } catch (error) {
     console.error('Error creating game:', error);
     return NextResponse.json(

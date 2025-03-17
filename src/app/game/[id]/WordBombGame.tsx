@@ -1,9 +1,10 @@
 import React, { useState, useEffect } from "react";
-import { Game, Player } from "@/hooks/useSocket";
+import { Game, Player, LobbyState } from "@/hooks/useSocket";
 
 interface WordBombGameProps {
   gameState: Game;
   currentPlayer: Player | null;
+  lobbyState: LobbyState | null;
   onSubmitWord: (word: string) => Promise<void>;
   wordInput: string;
   setWordInput: (value: string) => void;
@@ -12,6 +13,7 @@ interface WordBombGameProps {
 const WordBombGame: React.FC<WordBombGameProps> = ({
   gameState,
   currentPlayer,
+  lobbyState,
   onSubmitWord,
   wordInput,
   setWordInput,
@@ -20,6 +22,18 @@ const WordBombGame: React.FC<WordBombGameProps> = ({
   const [lastWord, setLastWord] = useState<string>("");
   const isMyTurn =
     currentPlayer && gameState.currentPlayerId === currentPlayer.id;
+
+  // Get updated player information including connection status
+  const getUpdatedPlayerStatus = (player: Player) => {
+    const playerFromLobby = lobbyState?.players.find((p) => p.id === player.id);
+    return {
+      ...player,
+      isConnected: playerFromLobby?.isConnected ?? true,
+    };
+  };
+
+  // Get a list of players with updated connection information
+  const playersWithStatus = gameState.players.map(getUpdatedPlayerStatus);
 
   // Set up timer
   useEffect(() => {
@@ -117,7 +131,7 @@ const WordBombGame: React.FC<WordBombGameProps> = ({
       <div className="mb-6">
         <h3 className="text-lg font-semibold mb-2 text-gray-900">Players</h3>
         <div className="grid grid-cols-2 gap-4">
-          {gameState.players.map((player) => (
+          {playersWithStatus.map((player) => (
             <div
               key={player.id}
               className={`p-4 rounded-lg ${
@@ -141,6 +155,15 @@ const WordBombGame: React.FC<WordBombGameProps> = ({
                       Current Turn
                     </span>
                   )}
+                  <span
+                    className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${
+                      player.isConnected
+                        ? "bg-green-100 text-green-800"
+                        : "bg-red-100 text-red-800"
+                    }`}
+                  >
+                    {player.isConnected ? "Online" : "Offline"}
+                  </span>
                 </div>
               </div>
               {player.score !== undefined && (

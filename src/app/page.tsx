@@ -234,36 +234,78 @@ export default function Home() {
                 No games available. Create one to get started!
               </p>
             ) : (
-              <div className="space-y-3 mt-2">
+              <div className="grid gap-4 grid-cols-1 md:grid-cols-2 lg:grid-cols-3">
                 {lobbyList.map((lobby) => (
                   <div
                     key={lobby.id}
-                    className="border-2 border-gray-200 rounded-lg p-4 hover:bg-gray-50 flex justify-between items-center"
+                    className="border border-gray-300 rounded-lg p-4 shadow-sm bg-white hover:shadow-md transition-shadow"
                   >
-                    <div>
-                      <h3 className="font-medium text-gray-900">
-                        {lobby.title}
-                      </h3>
-                      <p className="text-sm text-gray-700">
-                        Host: {lobby.host} • Players: {lobby.players}/2 •
-                        <span className="ml-1 font-medium text-blue-600">
-                          {getGameTypeDisplayName(lobby.gameType)}
-                        </span>
-                      </p>
+                    <div className="flex justify-between items-start mb-2">
+                      <div>
+                        <h3 className="text-lg font-medium">{lobby.title}</h3>
+                        <p className="text-gray-600 text-sm">
+                          Host: {lobby.host}
+                        </p>
+                      </div>
+                      <span className="bg-blue-100 text-blue-800 text-xs px-2 py-1 rounded-full">
+                        {lobby.gameType}
+                      </span>
                     </div>
-                    <button
-                      onClick={() => handleJoinGame(lobby.id)}
-                      disabled={
-                        !playerName.trim() || isJoining || lobby.players >= 2
-                      }
-                      className="px-4 py-2 bg-blue-600 text-white font-medium rounded-lg hover:bg-blue-700 
-                             focus:outline-none focus:ring-2 focus:ring-blue-500 
-                             disabled:opacity-50 disabled:cursor-not-allowed"
-                    >
-                      {isJoining ? "Joining..." : "Join"}
-                    </button>
+
+                    {/* Player list */}
+                    <div className="mt-2 mb-3">
+                      <h4 className="text-sm font-medium text-gray-700 mb-1">
+                        Players:
+                      </h4>
+                      <div className="flex flex-wrap gap-1">
+                        {lobby.playerNames?.map((name, index) => (
+                          <span
+                            key={index}
+                            className={`text-xs px-2 py-1 rounded-full ${
+                              name === lobby.host
+                                ? "bg-purple-100 text-purple-800"
+                                : "bg-gray-100 text-gray-800"
+                            }`}
+                          >
+                            {name} {name === lobby.host && "(Host)"}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="flex justify-between items-center mt-2">
+                      <div className="text-sm text-gray-600">
+                        {lobby.players} / 2 players
+                      </div>
+
+                      <button
+                        onClick={() => handleJoinGame(lobby.id)}
+                        disabled={
+                          lobby.players >= 2 || !playerName.trim() || isJoining
+                        }
+                        className={`px-3 py-1 rounded-md text-white text-sm ${
+                          lobby.players >= 2 || !playerName.trim() || isJoining
+                            ? "bg-gray-400 cursor-not-allowed"
+                            : "bg-blue-500 hover:bg-blue-600"
+                        }`}
+                      >
+                        {isJoining
+                          ? "Joining..."
+                          : lobby.players >= 2
+                          ? "Full"
+                          : "Join"}
+                      </button>
+                    </div>
                   </div>
                 ))}
+
+                {lobbyList.length === 0 && (
+                  <div className="col-span-full p-6 text-center">
+                    <p className="text-gray-500">
+                      No active games found. Create one to get started!
+                    </p>
+                  </div>
+                )}
               </div>
             )}
           </div>

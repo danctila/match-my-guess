@@ -19,6 +19,7 @@ export default function GamePage() {
     gameState,
     currentPlayer,
     winningWord,
+    lobbyState,
     joinGame,
     setSecretWord,
     makeGuess,
@@ -98,6 +99,7 @@ export default function GamePage() {
             gameState={gameState}
             currentPlayer={currentPlayer}
             winningWord={winningWord}
+            lobbyState={lobbyState}
             onSubmitWord={async (word: string) => {
               if (
                 gameState.status === "SETTING_WORDS" &&
@@ -118,6 +120,7 @@ export default function GamePage() {
           <WordBombGame
             gameState={gameState}
             currentPlayer={currentPlayer}
+            lobbyState={lobbyState}
             onSubmitWord={async (word: string) => {
               await makeGuess(word);
             }}

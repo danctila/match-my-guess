@@ -13,6 +13,7 @@ export interface Player {
   socketId: string;
   secretWord: string; 
   isHost: boolean;
+  isConnected?: boolean;
   score?: number; // For games that track scores
 }
 
@@ -32,6 +33,7 @@ export interface Game {
   guesses: Guess[];
   winningWord: string | null;
   createdAt: Date;
+  countdownSeconds?: number;
   // Word Bomb specific properties
   currentPlayerId?: string;
   turnTimeLimit?: number;
@@ -45,115 +47,187 @@ export interface GameListItem {
   host: string;
   status: 'WAITING' | 'SETTING_WORDS' | 'PLAYING' | 'COMPLETED';
   gameType: GameType;
+  playerNames: string[];
 }
 
-// Create a socket instance
-let socket: Socket | null = null;
+export interface LobbyState {
+  id: string;
+  title: string;
+  host: string;
+  hostId?: string; // Add hostId to correctly identify the host
+  players: {
+    id: string;
+    name: string;
+    isHost: boolean;
+    isConnected: boolean;
+  }[];
+}
 
 export function useSocket() {
+  const [socket, setSocket] = useState<Socket | null>(null);
   const [isConnected, setIsConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lobbyList, setLobbyList] = useState<GameListItem[]>([]);
   const [gameState, setGameState] = useState<Game | null>(null);
   const [currentPlayer, setCurrentPlayer] = useState<Player | null>(null);
   const [winningWord, setWinningWord] = useState<string | null>(null);
+  const [lobbyState, setLobbyState] = useState<LobbyState | null>(null);
   const [supportedGameTypes, setSupportedGameTypes] = useState<string[]>(['WORD_MATCH', 'WORD_BOMB']);
+  const [isConnecting, setIsConnecting] = useState(true);
 
-  // Initialize socket connection
   useEffect(() => {
-    // Create socket if it doesn't exist
-    if (!socket) {
-      console.log('Creating new socket connection to:', SOCKET_URL);
-      socket = io(SOCKET_URL);
-    }
+    // Initialize socket with reconnection options
+    const socketInstance = io(process.env.NEXT_PUBLIC_SOCKET_URL || 'http://localhost:4000', {
+      reconnection: true,
+      reconnectionAttempts: 5,
+      reconnectionDelay: 1000,
+      reconnectionDelayMax: 5000,
+      timeout: 20000,
+    });
+
+    setSocket(socketInstance);
 
     // Connection events
-    const onConnect = () => {
-      console.log('Socket connected:', socket?.id);
+    socketInstance.on('connect', () => {
+      console.log('Socket connected');
       setIsConnected(true);
-      setError(null);
-      
-      // Request the game list when connected
-      socket?.emit('getGameList');
-    };
+      setIsConnecting(false);
+      socketInstance.emit('getGameList');
 
-    const onDisconnect = () => {
+      // Try to reconnect to game if we have stored game info
+      const storedGameId = sessionStorage.getItem('gameId');
+      const storedPlayerId = sessionStorage.getItem('playerId');
+      if (storedGameId && storedPlayerId) {
+        console.log(`Attempting to reconnect to game ${storedGameId} as player ${storedPlayerId}`);
+        socketInstance.emit('reconnect', storedGameId, storedPlayerId, (response: any) => {
+          if (!response.success) {
+            console.error('Failed to reconnect:', response.error);
+            sessionStorage.removeItem('gameId');
+            sessionStorage.removeItem('playerId');
+          }
+        });
+      }
+    });
+    
+    socketInstance.on('disconnect', () => {
       console.log('Socket disconnected');
       setIsConnected(false);
-    };
-
-    const onConnectError = (err: Error) => {
-      console.error('Connection error:', err.message);
-      setError(`Connection error: ${err.message}`);
+      setIsConnecting(true);
+    });
+    
+    socketInstance.on('connect_error', (error) => {
+      console.error('Connection error:', error);
       setIsConnected(false);
-    };
+      setIsConnecting(false);
+    });
 
-    // Game events
-    const onGameState = (state: Game) => {
-      console.log('Game state updated:', state);
+    // Game state events
+    socketInstance.on('gameState', (state: Game) => {
+      console.log('Received game state:', state);
       setGameState(state);
       
-      // Update current player if we have a player with matching socket ID
-      if (socket) {
-        const player = state.players.find(p => p.socketId === socket?.id);
-        if (player) {
-          setCurrentPlayer(player);
-        }
+      // Store game and player info for reconnection
+      if (state.id) {
+        sessionStorage.setItem('gameId', state.id);
       }
-    };
-
-    const onGameList = (games: GameListItem[]) => {
-      console.log('Received game list:', games);
-      setLobbyList(games);
-    };
-
-    const onGameOver = (word: string) => {
-      console.log('Game over! Winning word:', word);
-      setWinningWord(word);
-    };
-
-    const onGameNotFound = () => {
+      if (state.players.find((p: Player) => p.socketId === socketInstance?.id)) {
+        setCurrentPlayer(state.players.find((p: Player) => p.socketId === socketInstance?.id) as Player);
+        
+        // Store player ID in session storage for reconnection
+        sessionStorage.setItem('playerId', state.players.find((p: Player) => p.socketId === socketInstance?.id)?.id ?? '');
+      }
+    });
+    
+    // Lobby state events
+    socketInstance.on('lobbyState', (state: LobbyState) => {
+      console.log('Received lobby state:', state);
+      setLobbyState(state);
+      
+      // Update game state players with connection status from lobby state
+      if (gameState) {
+        setGameState({
+          ...gameState,
+          players: gameState.players.map(player => ({
+            ...player,
+            isConnected: state.players.find((p: { id: string }) => p.id === player.id)?.isConnected ?? true
+          }))
+        });
+      }
+    });
+    
+    // Game list events
+    socketInstance.on('gameList', (list) => {
+      console.log('Received game list:', list);
+      setLobbyList(list);
+    });
+    
+    socketInstance.on('gameListUpdated', () => {
+      console.log('Game list updated, requesting fresh list');
+      socketInstance.emit('getGameList');
+    });
+    
+    // Player connection events
+    socketInstance.on('playerReconnected', (data) => {
+      console.log(`Player reconnected: ${data.playerName} (${data.playerId})`);
+      if (lobbyState) {
+        setLobbyState({
+          ...lobbyState,
+          players: lobbyState.players.map(p => 
+            p.id === data.playerId ? { ...p, isConnected: true } : p
+          )
+        });
+      }
+      
+      // Update game state if we have it
+      if (gameState) {
+        setGameState({
+          ...gameState,
+          players: gameState.players.map(p => 
+            p.id === data.playerId ? { ...p, isConnected: true } : p
+          )
+        });
+      }
+    });
+    
+    socketInstance.on('playerDisconnected', (data) => {
+      console.log(`Player disconnected: ${data.playerName} (${data.playerId})`);
+      if (lobbyState) {
+        setLobbyState({
+          ...lobbyState,
+          players: lobbyState.players.map(p => 
+            p.id === data.playerId ? { ...p, isConnected: false } : p
+          )
+        });
+      }
+      
+      // Update game state if we have it
+      if (gameState) {
+        setGameState({
+          ...gameState,
+          players: gameState.players.map(p => 
+            p.id === data.playerId ? { ...p, isConnected: false } : p
+          )
+        });
+      }
+    });
+    
+    socketInstance.on('gameNotFound', () => {
       console.error('Game not found');
       setError('Game not found or no longer available');
-    };
+    });
 
-    const onGameFull = () => {
-      console.error('Game is full or already started');
-      setError('Game is full or has already started');
-    };
-
-    const onError = (message: string) => {
-      console.error('Socket error:', message);
-      setError(message);
-    };
-
-    // Register event handlers
-    socket.on('connect', onConnect);
-    socket.on('disconnect', onDisconnect);
-    socket.on('connect_error', onConnectError);
-    socket.on('error', onError);
-    socket.on('gameState', onGameState);
-    socket.on('gameList', onGameList);
-    socket.on('gameOver', onGameOver);
-    socket.on('gameNotFound', onGameNotFound);
-    socket.on('gameFull', onGameFull);
-
-    // If socket is already connected, trigger the connect handler
-    if (socket && socket.connected) {
-      onConnect();
-    }
-
-    // Clean up event listeners on unmount
     return () => {
-      socket?.off('connect', onConnect);
-      socket?.off('disconnect', onDisconnect);
-      socket?.off('connect_error', onConnectError);
-      socket?.off('error', onError);
-      socket?.off('gameState', onGameState);
-      socket?.off('gameList', onGameList);
-      socket?.off('gameOver', onGameOver);
-      socket?.off('gameNotFound', onGameNotFound);
-      socket?.off('gameFull', onGameFull);
+      socketInstance.off('connect');
+      socketInstance.off('disconnect');
+      socketInstance.off('connect_error');
+      socketInstance.off('gameState');
+      socketInstance.off('lobbyState');
+      socketInstance.off('gameList');
+      socketInstance.off('gameListUpdated');
+      socketInstance.off('playerReconnected');
+      socketInstance.off('playerDisconnected');
+      socketInstance.off('gameNotFound');
+      socketInstance.close();
     };
   }, []);
 
@@ -251,15 +325,26 @@ export function useSocket() {
       }
 
       console.log('Leaving game');
-      socket.emit('leaveGame', () => {
-        setGameState(null);
-        setCurrentPlayer(null);
-        setWinningWord(null);
-        console.log('Left game successfully');
+      socket.emit('leaveGame', (response: any) => {
+        if (response.success) {
+          // Clear all game state
+          setGameState(null);
+          setCurrentPlayer(null);
+          setWinningWord(null);
+          setLobbyState(null);
+          
+          // Clear stored game info
+          sessionStorage.removeItem('gameId');
+          sessionStorage.removeItem('playerId');
+          
+          console.log('Left game successfully');
+        } else {
+          console.error('Failed to leave game:', response.error);
+        }
         resolve();
       });
     });
-  }, [isConnected]);
+  }, [socket, isConnected]);
 
   // Refresh game list
   const refreshGameList = useCallback(() => {
@@ -267,7 +352,29 @@ export function useSocket() {
       console.log('Refreshing game list');
       socket.emit('getGameList');
     }
-  }, [isConnected]);
+  }, [socket, isConnected]);
+
+  // Auto-refresh game list periodically
+  useEffect(() => {
+    if (!isConnected || !socket) return;
+    
+    const interval = setInterval(() => {
+      socket.emit('getGameList');
+    }, 3000);
+    
+    return () => clearInterval(interval);
+  }, [socket, isConnected]);
+
+  // Handle disconnection cleanup
+  useEffect(() => {
+    if (!isConnected && currentPlayer) {
+      // Clear game state on disconnection
+      setGameState(null);
+      setCurrentPlayer(null);
+      setWinningWord(null);
+      setLobbyState(null);
+    }
+  }, [isConnected, currentPlayer]);
 
   // Get supported game types
   const getSupportedGameTypes = useCallback((): string[] => {
@@ -277,11 +384,13 @@ export function useSocket() {
   return {
     socket,
     isConnected,
+    isConnecting,
     error,
     lobbyList,
     gameState,
     currentPlayer,
     winningWord,
+    lobbyState,
     createGame,
     joinGame,
     setSecretWord,

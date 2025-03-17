@@ -33,9 +33,12 @@ export class WordMatchGame extends BaseGame {
   }> = [];
   
   private title: string = 'Match My Guess';
-  private status: string = 'IN_PROGRESS';
+  private status: string = 'WAITING';
+  private dbStatus: string = 'IN_PROGRESS'; // Track the database status separately
   private winningWord: string | null = null;
   private lobbyId?: string;
+  private countdownTimer: NodeJS.Timeout | null = null;
+  private countdownSeconds: number = 0;
   
   constructor(prisma: PrismaClient, io: any) {
     super(prisma, io);
@@ -48,6 +51,10 @@ export class WordMatchGame extends BaseGame {
   async initialize(gameId: string, config: GameConfig): Promise<void> {
     this.gameId = gameId;
     this.title = config.title || 'Match My Guess';
+    this.status = 'WAITING'; // Game state in metadata
+    this.dbStatus = 'IN_PROGRESS'; // Database status
+    
+    console.log(`Initializing WordMatchGame for game ${gameId}, title: ${this.title}`);
     
     // Get game data from database if it exists
     const game = await this.prisma.$queryRaw`
@@ -60,7 +67,15 @@ export class WordMatchGame extends BaseGame {
     if (game && Array.isArray(game) && game.length > 0) {
       const gameData = game[0];
       this.lobbyId = gameData.lobbyId;
-      this.status = gameData.status;
+      this.dbStatus = gameData.status;
+      
+      // Get game state from metadata
+      const metadata = gameData.metadata as any;
+      if (metadata?.status) {
+        this.status = metadata.status;
+      }
+      
+      console.log(`Loaded game data for game ${gameId}, status: ${this.status}`);
       
       // Load players
       const players = await this.prisma.$queryRaw`
@@ -111,23 +126,60 @@ export class WordMatchGame extends BaseGame {
       }
       
       // Check if game is already complete
-      const metadata = gameData.metadata as any;
       if (metadata && metadata.winningWord) {
         this.winningWord = metadata.winningWord;
       }
     }
+
+    // Update game metadata in database to ensure it's correct
+    await this.prisma.$executeRaw`
+      UPDATE "Game"
+      SET "metadata" = jsonb_set(COALESCE("metadata", '{}'::jsonb), '{status}', ${JSON.stringify(this.status)}::jsonb)
+      WHERE id = ${this.gameId}
+    `;
   }
   
   async addPlayer(playerId: string, playerName: string, isHost: boolean): Promise<void> {
+    // Check if player already exists
+    if (this.players.has(playerId)) {
+      // Update the player's connection status
+      const player = this.players.get(playerId)!;
+      console.log(`Player ${playerName} (${playerId}) reconnected to game ${this.gameId}`);
+      
+      // Emit updated game state to all players
+      this.emitToGame('gameState', await this.getPublicGameState());
+      return;
+    }
+    
+    // Add new player
     this.players.set(playerId, {
       id: playerId,
       name: playerName,
-      isHost
+      isHost,
+      dbId: playerId
     });
+    
+    console.log(`Player ${playerName} (${playerId}) added to game ${this.gameId}`);
+    
+    // If we have 2 players and game is in WAITING state, start the countdown
+    if (this.players.size === 2 && this.status === 'WAITING') {
+      this.startCountdown();
+    }
+    
+    // Emit updated game state to all players
+    this.emitToGame('gameState', await this.getPublicGameState());
   }
   
   async removePlayer(playerId: string): Promise<void> {
     this.players.delete(playerId);
+    
+    // If a player leaves during countdown, cancel it
+    if (this.countdownTimer && this.status === 'WAITING') {
+      clearInterval(this.countdownTimer);
+      this.countdownTimer = null;
+      this.countdownSeconds = 0;
+      this.emitToGame('gameState', await this.getPublicGameState());
+    }
     
     // If all players left, abandon the game
     if (this.players.size === 0) {
@@ -154,8 +206,8 @@ export class WordMatchGame extends BaseGame {
       
       // Check if all players have set their secret words
       const allReady = Array.from(this.players.values()).every(p => p.secretWord);
-      if (allReady) {
-        await this.startGame();
+      if (allReady && this.status === 'SETTING_WORDS') {
+        await this.updateGameState('PLAYING');
       }
     }
   }
@@ -239,9 +291,11 @@ export class WordMatchGame extends BaseGame {
   }
   
   registerSocketEvents(socket: Socket, playerId: string): void {
+    // Update the player's socket ID
     const player = this.players.get(playerId);
     if (player) {
       player.socketId = socket.id;
+      console.log(`Registered socket events for player ${player.name} (${playerId}) in game ${this.gameId}`);
     }
     
     // Join the game room
@@ -251,18 +305,80 @@ export class WordMatchGame extends BaseGame {
     this.getPublicGameState().then(gameState => {
       socket.emit('gameState', gameState);
     });
+    
+    // Handle set secret word
+    socket.on('setSecretWord', async (word: string, callback) => {
+      try {
+        if (!player) {
+          callback(false);
+          return;
+        }
+        
+        // Set the player's secret word
+        player.secretWord = word.toLowerCase().trim();
+        
+        // Update player metadata in database
+        await this.prisma.$executeRaw`
+          UPDATE "Player"
+          SET "metadata" = jsonb_set(COALESCE("metadata", '{}'::jsonb), '{secretWord}', ${JSON.stringify(player.secretWord)}::jsonb)
+          WHERE id = ${playerId}
+        `;
+        
+        console.log(`Player ${player.name} set secret word: ${player.secretWord}`);
+        
+        // Check if all players have set their secret words
+        const allPlayersReady = Array.from(this.players.values()).every(p => p.secretWord);
+        if (allPlayersReady && this.status === 'SETTING_WORDS') {
+          this.status = 'PLAYING';
+          
+          // Update game status in database
+          await this.prisma.$executeRaw`
+            UPDATE "Game"
+            SET "status" = 'IN_PROGRESS',
+                "metadata" = jsonb_set(COALESCE("metadata", '{}'::jsonb), '{status}', '"PLAYING"'::jsonb)
+            WHERE id = ${this.gameId}
+          `;
+        }
+        
+        // Emit updated game state to all players
+        this.emitToGame('gameState', await this.getPublicGameState());
+        
+        callback(true);
+      } catch (error) {
+        console.error('Error setting secret word:', error);
+        callback(false);
+      }
+    });
   }
   
   async getGameState(): Promise<any> {
+    // Get player connection status from database
+    const playerStatuses = await this.prisma.$queryRaw<Array<{id: string, metadata: any, lastActiveAt: Date}>>`
+      SELECT id, metadata, "lastActiveAt"
+      FROM "Player"
+      WHERE "gameId" = ${this.gameId}
+    `;
+    
+    // Create a map of player IDs to connection status
+    const connectionStatus = new Map<string, boolean>();
+    for (const status of playerStatuses) {
+      const isDisconnected = status.metadata?.isDisconnected === true;
+      connectionStatus.set(status.id, !isDisconnected);
+    }
+    
     return {
       id: this.gameId,
       title: this.title,
       status: this.status,
+      gameType: this.gameType,
+      countdownSeconds: this.countdownSeconds,
       players: Array.from(this.players.values()).map(p => ({
         id: p.id,
         name: p.name,
+        socketId: p.socketId,
+        secretWord: p.secretWord || '',
         isHost: p.isHost,
-        secretWord: p.secretWord || ''
+        isConnected: connectionStatus.get(p.id) ?? true
       })),
       guesses: this.guesses.map(g => ({
         playerId: g.playerId,
@@ -305,16 +421,21 @@ export class WordMatchGame extends BaseGame {
   
   async endGame(metadata: GameMetadata): Promise<void> {
     this.status = 'COMPLETED';
+    this.dbStatus = 'COMPLETED';
+    
     if (metadata.winningWord) {
       this.winningWord = metadata.winningWord;
     }
     
-    // Update game status in database
+    // Update game status and metadata in database
     await this.prisma.$executeRaw`
       UPDATE "Game"
       SET "status" = 'COMPLETED',
           "endedAt" = NOW(),
-          "metadata" = jsonb_set("metadata"::jsonb, '{winningWord}', ${JSON.stringify(this.winningWord)}::jsonb)
+          "metadata" = jsonb_set(
+            jsonb_set(COALESCE("metadata", '{}'::jsonb), '{status}', '"COMPLETED"'::jsonb),
+            '{winningWord}', ${JSON.stringify(this.winningWord)}::jsonb
+          )
       WHERE id = ${this.gameId}
     `;
     
@@ -322,7 +443,7 @@ export class WordMatchGame extends BaseGame {
     if (this.lobbyId) {
       await this.prisma.$executeRaw`
         UPDATE "Lobby"
-        SET "status" = 'FINISHED'
+        SET "status" = 'COMPLETED'
         WHERE id = ${this.lobbyId}
       `;
     }
@@ -334,24 +455,26 @@ export class WordMatchGame extends BaseGame {
   }
   
   async abandonGame(): Promise<void> {
+    // Clear any active countdown
+    if (this.countdownTimer) {
+      clearInterval(this.countdownTimer);
+      this.countdownTimer = null;
+    }
+    
     this.status = 'ABANDONED';
+    this.dbStatus = 'ABANDONED';
     
     // Update game status in database
     await this.prisma.$executeRaw`
       UPDATE "Game"
       SET "status" = 'ABANDONED',
-          "endedAt" = NOW()
+          "endedAt" = NOW(),
+          "metadata" = jsonb_set(COALESCE("metadata", '{}'::jsonb), '{status}', '"ABANDONED"'::jsonb)
       WHERE id = ${this.gameId}
     `;
     
-    // Update lobby status
-    if (this.lobbyId) {
-      await this.prisma.$executeRaw`
-        UPDATE "Lobby"
-        SET "status" = 'ABANDONED'
-        WHERE id = ${this.lobbyId}
-      `;
-    }
+    // Emit final game state
+    this.emitToGame('gameState', await this.getPublicGameState());
   }
   
   private checkForMatchingGuess(): string | null {
@@ -387,5 +510,47 @@ export class WordMatchGame extends BaseGame {
     const allMatch = allGuesses.every(guess => guess === firstGuess);
     
     return allMatch ? firstGuess : null;
+  }
+  
+  private async updateGameState(newState: string): Promise<void> {
+    this.status = newState;
+    
+    // Update metadata in database
+    await this.prisma.$executeRaw`
+      UPDATE "Game"
+      SET "metadata" = jsonb_set(COALESCE("metadata", '{}'::jsonb), '{status}', ${JSON.stringify(this.status)}::jsonb)
+      WHERE id = ${this.gameId}
+    `;
+    
+    // Emit the updated game state
+    this.emitToGame('gameState', await this.getPublicGameState());
+  }
+  
+  private startCountdown(): void {
+    this.countdownSeconds = 5; // 5 second countdown
+    
+    // Clear any existing timer
+    if (this.countdownTimer) {
+      clearInterval(this.countdownTimer);
+    }
+    
+    // Start the countdown
+    this.countdownTimer = setInterval(async () => {
+      this.countdownSeconds--;
+      
+      // Emit the current game state with updated countdown
+      this.emitToGame('gameState', await this.getPublicGameState());
+      
+      if (this.countdownSeconds <= 0) {
+        // Clear the timer
+        if (this.countdownTimer) {
+          clearInterval(this.countdownTimer);
+          this.countdownTimer = null;
+        }
+        
+        // Move to setting words phase
+        await this.updateGameState('SETTING_WORDS');
+      }
+    }, 1000);
   }
 } 

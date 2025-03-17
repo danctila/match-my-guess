@@ -5,8 +5,8 @@ import { WordMatchGame } from './WordMatchGame';
 // Map of game type to game class
 const gameImplementations: Record<string, any> = {
   'WORD_MATCH': WordMatchGame,
+  'WORD_BOMB': WordMatchGame, // Temporarily use WordMatchGame for WORD_BOMB until implemented
   // Add more game types here as they are implemented
-  // 'WORD_BOMB': WordBombGame,
   // 'CROSSWORD': CrosswordGame,
 };
 
@@ -32,12 +32,16 @@ export class GameFactory {
   static async createGame(gameId: string, gameType: string, config: any): Promise<GameInterface> {
     // Check if game already exists
     if (GameFactory.games.has(gameId)) {
+      console.log(`Game instance already exists for game ${gameId}`);
       return GameFactory.games.get(gameId)!;
     }
+    
+    console.log(`Creating new game instance for game ${gameId}, type: ${gameType}`);
     
     // Get the game implementation class
     const GameClass = gameImplementations[gameType];
     if (!GameClass) {
+      console.error(`Game type '${gameType}' is not supported`);
       throw new Error(`Game type '${gameType}' is not supported`);
     }
     
@@ -47,6 +51,7 @@ export class GameFactory {
     
     // Store the game instance
     GameFactory.games.set(gameId, game);
+    console.log(`Game instance created for game ${gameId}, type: ${gameType}`);
     
     return game;
   }
